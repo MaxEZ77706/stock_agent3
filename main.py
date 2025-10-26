@@ -29,10 +29,10 @@ T.manual_seed(SEED)
 INITIAL_ACCOUNT_BALANCE = 1_000.0
 
 PERCENT_CAPITAL  = 0.30
-TARGET_DAILY_VOL = 0.035
+TARGET_DAILY_VOL = 0.03
 TURNOVER_COST    = 1e-5
 SLIPPAGE_BPS     = 0.0
-LEVER_CAP        = 1.75
+LEVER_CAP        = 1.50
 KILL_THRESH      = 0.50
 DD_COEF          = 0.50
 
@@ -41,25 +41,24 @@ TREND_STRENGTH_CLIP  = (0.0, 1.0)
 TREND_GATE           = True
 
 SMOOTH_COST = 5e-4
-HOLD_COST   = 5e-4
+HOLD_COST   = 1e-4
 
 WIN_REWARD   = 0.3
 LOSS_PENALTY = -0.3
 WINLOSS_EPS  = 2e-5
-WINLOSS_Z    = 0.015
+WINLOSS_Z    = 0.012
 
-ALPHA_PNL   = 0.9
+ALPHA_PNL   = 1.1
 REWARD_CLIP = 3.0
-BETA_EXCESS = 0.5
+BETA_EXCESS = 0.4
 
 ADX_ENTER   = 18.0     # порог для gate
 ADX_FULL    = 28.0
-TRADE_ADX_MIN = 14.0   # жёсткий фильтр
-EMA_GAP_MIN   = 0.002  # 0.7%
+TRADE_ADX_MIN = 15.5   # жёсткий фильтр
+EMA_GAP_MIN   = 0.007  # 0.7%
 
 APPLY_DEADZONE_TRAIN = False
-SEQ_LEN = 32
-
+SEQ_LEN = 48
 # ===========================
 # Data
 # ===========================
@@ -68,7 +67,6 @@ df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 df = df.sort_index()
 train_df = df.loc["2017-01-01":"2021-12-31"].copy()
 test_df  = df.loc["2022-01-01":"2024-12-31"].copy()
-
 def add_features(ddf: pd.DataFrame) -> pd.DataFrame:
     ddf = ddf.copy()
 
@@ -125,11 +123,7 @@ def add_features(ddf: pd.DataFrame) -> pd.DataFrame:
     ddf["VOL_Z"]   = (ddf["Volume"] - vol_mean20) / ddf["Volume"].rolling(20).std().replace(0, np.nan)
     ddf["VOL_PCT"] = ddf["Volume"] / vol_mean20.replace(0, np.nan)
 
-    adx = ADXIndicator(ddf["High"], ddf["Low"], ddf["Close"], window=14)
-    ddf["ADX"] = adx.adx().fillna(0.0)  
-    
     # аккуратная зачистка NaN/inf только для модельных фич (RAW НЕ ТРОГАЕМ)
-    
     for c in ["VWAP","RSI","EMA20","EMA50","MACD","MACD_signal","MACD_hist",
               "BB_high","BB_low","BB_width","BB_pos",
               "RET1","RET5","RET20","ATR","ATR_PCT","VOL_REGIME",
@@ -138,15 +132,8 @@ def add_features(ddf: pd.DataFrame) -> pd.DataFrame:
 
     return ddf
 train_df = add_features(train_df)
-test_df  = add_features(test_df) 
-feat_cols = [
-    "Open","High","Low","Close","Volume","VWAP",
-    "RSI","EMA20","EMA50","EMA20_SLOPE","EMA50_SLOPE","Trend_Dir",  # если хочешь, можешь дать и ADX (не RAW) в модель
-    "MACD","MACD_signal","MACD_hist",
-    "BB_width","BB_pos",
-    "RET1","RET5","RET20","ATR","ATR_PCT","VOL_REGIME",
-    "VOL_Z","VOL_PCT","ADX"
-]
+test_df  = add_features(test_df)
+# ----- Стандартизация только OBS-фич -----
 def rolling_standardize(df_in, cols, win=252, min_periods=20):
     df_std = df_in.copy()
     for c in cols:
@@ -154,6 +141,16 @@ def rolling_standardize(df_in, cols, win=252, min_periods=20):
         roll_std  = df_std[c].rolling(win, min_periods=min_periods).std()
         df_std[c] = (df_std[c] - roll_mean) / (roll_std.replace(0, 1e-12))
     return df_std
+
+feat_cols = [
+    "Open","High","Low","Close","Volume","VWAP",
+    "RSI","EMA20","EMA50","EMA20_SLOPE","EMA50_SLOPE","Trend_Dir",  # если хочешь, можешь дать и ADX (не RAW) в модель
+    "MACD","MACD_signal","MACD_hist",
+    "BB_width","BB_pos",
+    "RET1","RET5","RET20","ATR","ATR_PCT","VOL_REGIME",
+    "VOL_Z","VOL_PCT"
+]
+
 
 # 1) Сохраняем сырые фичи отдельно
 train_raw = train_df.copy()
@@ -207,9 +204,8 @@ def bh_test_from_full(price_full, test_like, pct_capital=1.0):
     return bh_curve_from_prices(px, pct_capital)
 
 
-
 # === Soft-scale для вол-таргетинга ===
-def soft_scale(vol, target=TARGET_DAILY_VOL, alpha=0.5):
+def soft_scale(vol, target=TARGET_DAILY_VOL, alpha=0.9):
     s_full = target / max(vol, 1e-6)      # как "full"
     s_cap  = min(1.0, s_full)             # как "cap"
     return alpha * s_full + (1 - alpha) * s_cap
@@ -251,6 +247,7 @@ class PPOMemory:
         self.states.clear(); self.probs.clear(); self.actions.clear()
         self.rewards.clear(); self.dones.clear(); self.vals.clear()
 
+
 # ===========================
 # Environment
 # ===========================
@@ -259,15 +256,14 @@ class StockTradingEnv(gym.Env):
 
     def __init__(self, df, episode_len=256, randomize=True, lag=20):
         super().__init__()
-        self.df = df.reset_index(drop=True).copy()
+        self.df = df
         self.lag = int(lag)
-        self.max_steps = len(self.df)
-        self.episode_len = int(min(episode_len or self.max_steps, max(2, self.max_steps - self.lag)))
+        self.max_steps = len(df)
+        self.episode_len = int(min(episode_len or self.max_steps, self.max_steps - self.lag))
         self.randomize = bool(randomize)
-
         self.hold_clock = 0
         self.last_sign  = 0
-        self.min_hold   = 7
+        self.min_hold   = 5   # было 3
 
         sma20 = self.df["Close_Price"].rolling(20).mean()
         sma50 = self.df["Close_Price"].rolling(50).mean()
@@ -296,47 +292,54 @@ class StockTradingEnv(gym.Env):
 
     def _next_observation(self):
         r = self.df.loc[self.current_step]
-        core = r.reindex(feat_cols).astype(float).to_numpy(np.float32)
+        core = np.array([float(r[c]) for c in feat_cols], dtype=np.float32)
         obs = np.concatenate([core, np.array([float(self.long_short_ratio)], dtype=np.float32)])
         return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _take_action(self, action):
         position = float(action[0])
-        asset_ret = float(self.ret_series.iloc[self.current_step + 1]) if (self.current_step + 1) < self.max_steps else 0.0
+    
+        # ретёрн актива на следующий шаг (ограничим хвост)
+        if (self.current_step + 1) < self.max_steps:
+            asset_ret = float(self.ret_series.iloc[self.current_step + 1])
+        else:
+            asset_ret = 0.0
         asset_ret = float(np.clip(asset_ret, -0.12, 0.12))
-
+    
+        # текущая вола и вол-таргетинг
         vol = float(self.vol_series.iloc[self.current_step]) if self.current_step < len(self.vol_series) else 0.0
         self.volatility = vol if (np.isfinite(vol) and vol > 0) else 1e-6
-
         scale = soft_scale(self.volatility)
         eff_position = float(np.clip(position * scale, -1.0, 1.0))
+    
+        # --- RAW-индикаторы из self.df в текущем шаге ---
+        adx       = float(self.df.loc[self.current_step, "ADX_RAW"])
+        ema20_raw = float(self.df.loc[self.current_step, "EMA20_RAW"])
+        ema50_raw = float(self.df.loc[self.current_step, "EMA50_RAW"])
+        close_px  = float(self.df.loc[self.current_step, "Close_Price"])
+    
+        trend_dir = 1.0 if ema20_raw >= ema50_raw else -1.0
+        ema_gap   = abs(ema20_raw - ema50_raw) / max(abs(close_px), 1e-6)
 
-        # --- Фильтры/тренд на RAW ---
-        adx   = float(self.df.loc[self.current_step, "ADX_RAW"])
-        ema20 = float(self.df.loc[self.current_step, "EMA20_RAW"])
-        ema50 = float(self.df.loc[self.current_step, "EMA50_RAW"])
-        trend_dir = 1.0 if ema20 >= ema50 else -1.0
-
-        # Жёсткий фильтр входов
-        close_px = float(self.df.loc[self.current_step, "Close_Price"])
-        ema_gap  = abs(ema20 - ema50) / max(abs(close_px), 1e-6)
-        # мягкие коэффициенты (0..1), без жесткого нуля
-        k_adx = float(np.clip((adx - (TRADE_ADX_MIN - 5.0)) / 5.0, 0.0, 1.0))             # линейная рампа в зоне [MIN-5, MIN]
-        k_gap = float(np.clip(ema_gap / max(EMA_GAP_MIN, 1e-6), 0.0, 1.0))                # чем меньше gap, тем сильнее подавляем
-        eff_position *= (k_adx * k_gap)
-
-
-        # Gate по силе тренда
+        # ===== ЖЁСТКИЙ ФИЛЬТР ВХОДОВ: ADX + EMA-gap =====
+        if (adx < TRADE_ADX_MIN) or (ema_gap < EMA_GAP_MIN):
+            eff_position = 0.0
+    
+        # gate по силе тренда (0..1)
         gate = float(np.clip((adx - ADX_ENTER) / max(ADX_FULL - ADX_ENTER, 1e-6), 0.0, 1.0))
+    
+        # усиливаем/ослабляем позу по gate (минимум 0.3)
         eff_position *= (0.3 + 0.7 * gate)
+    
+        # против тренда приглушаем (в сильный тренд ~в ноль)
         if eff_position * trend_dir < 0:
-            eff_position *= (1.0 - 0.8 * gate)
-
+            eff_position *= (1.0 - 0.5 * gate)
+    
         if TREND_GATE:
             ts = float(np.clip(adx / 50.0, 0.0, 1.0))
             eff_position = float(np.clip(eff_position * (0.5 + 0.5 * ts), -1.0, 1.0))
-
-        # Min-hold
+    
+        # --- Min-hold: не даём резко менять знак раньше self.min_hold шагов ---
         sign = 0 if abs(eff_position) < 1e-6 else (1 if eff_position > 0 else -1)
         if sign == 0:
             self.hold_clock += 1
@@ -353,10 +356,10 @@ class StockTradingEnv(gym.Env):
                 self.hold_clock = 0
             else:
                 self.hold_clock += 1
-
-        raw_ret = eff_position * asset_ret
+    
+        raw_ret      = eff_position * asset_ret
         realized_ret = float(raw_ret)
-
+    
         traded_cap = max(self.available_balance, 0.0) * PERCENT_CAPITAL
         step_pnl   = traded_cap * realized_ret
         self.net_profit        += step_pnl
@@ -367,48 +370,50 @@ class StockTradingEnv(gym.Env):
         if turnover_fee:
             self.available_balance -= turnover_fee
             self.net_profit        -= turnover_fee
-
+    
         if eff_position > 0: self.num_trades_long  += 1
         if eff_position < 0: self.num_trades_short += 1
         den = self.num_trades_long + self.num_trades_short
         self.long_short_ratio = (self.num_trades_long / den) if den > 0 else 0.0
-
-        return realized_ret, eff_position, delta_pos, raw_ret, asset_ret, turnover_fee
-
+    
+        # ВОЗВРАЩАЕМ trend_dir, чтобы step() не пересчитывал
+        return realized_ret, eff_position, delta_pos, raw_ret, asset_ret, turnover_fee, trend_dir
     def step(self, action):
-        realized_ret, eff_position, delta_pos, raw_ret, asset_ret, turnover_fee = self._take_action(action)
-
+        (realized_ret, eff_position, delta_pos, raw_ret,
+         asset_ret, turnover_fee, trend_dir) = self._take_action(action)
+    
         smooth_pen = float(SMOOTH_COST * (delta_pos ** 2))
         hold_pen   = float(HOLD_COST   * (eff_position ** 2))
-
-        trend_strength = float(np.clip(self.df.loc[self.current_step, "ADX_RAW"] / 50.0, *TREND_STRENGTH_CLIP))
-        trend_dir = 1.0 if float(self.df.loc[self.current_step, "Trend_Dir"]) >= 0.0 else -1.0
+    
+        # сила тренда по ADX_RAW
+        trend_strength = float(np.clip(float(self.df.loc[self.current_step, "ADX_RAW"]) / 50.0,
+                                       *TREND_STRENGTH_CLIP))
         trend_bonus = TREND_BONUS_COEF * trend_strength * np.sign(eff_position) * trend_dir
-
+    
         thr_abs = max(WINLOSS_EPS, WINLOSS_Z * self.volatility * (abs(eff_position) + 0.1))
         if   raw_ret >  thr_abs: base = WIN_REWARD
         elif raw_ret < -thr_abs: base = LOSS_PENALTY
         else:                    base = 0.0
-
+    
         b_t = float(self.baseline_pos_series.iloc[self.current_step])
         excess_step = (eff_position - b_t) * asset_ret
-
+    
         equity = self.available_balance / INITIAL_ACCOUNT_BALANCE
         self.equity_peak = max(self.equity_peak, equity)
         dd = min(0.0, equity / self.equity_peak - 1.0)
-
+    
         txn_cost_ret = (TURNOVER_COST + SLIPPAGE_BPS) * abs(delta_pos) * PERCENT_CAPITAL
-
+    
         reward = base + ALPHA_PNL * realized_ret + BETA_EXCESS * excess_step \
                + trend_bonus - smooth_pen - hold_pen - DD_COEF * (-dd) - txn_cost_ret
         reward = float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
-
+    
         self.prev_position = eff_position
         hard_stop = (dd < -KILL_THRESH)
-
+    
         self.current_step += 1
         done = hard_stop or (self.current_step >= self.window_end - 1)
-
+    
         info = {
             "drawdown": float(dd),
             "base_reward": float(base),
@@ -422,6 +427,7 @@ class StockTradingEnv(gym.Env):
         }
         return self._next_observation(), reward, done, info
 
+
     def reset(self, start_balance=None):
         self.available_balance = float(start_balance) if start_balance is not None else INITIAL_ACCOUNT_BALANCE
         self.net_profit = 0.0
@@ -432,12 +438,10 @@ class StockTradingEnv(gym.Env):
         self.last_sign  = 0
         self.equity_peak = self.available_balance / INITIAL_ACCOUNT_BALANCE
 
-        SAFE_START = max(252, SEQ_LEN, self.lag)
-        if self.randomize and self.max_steps - self.episode_len > SAFE_START:
-            start_idx = int(np.random.randint(SAFE_START, self.max_steps - self.episode_len + 1))
+        if self.randomize and self.max_steps > self.episode_len:
+            start_idx = int(np.random.randint(self.lag, self.max_steps - self.episode_len + 1))
         else:
-            start_idx = SAFE_START
-
+            start_idx = self.lag
         self.window_start = start_idx
         self.window_end   = min(self.max_steps, self.window_start + self.episode_len)
         self.current_step = self.window_start
@@ -449,6 +453,48 @@ class StockTradingEnv(gym.Env):
 
     def render(self, mode='human', close=False):
         pass
+
+class SimpleRNNBackbone(nn.Module):
+    def __init__(self, feat_dim, hidden=64, nlayers=1, dropout=0.1):
+        super().__init__()
+        self.rnn = nn.RNN(
+            input_size=feat_dim,
+            hidden_size=hidden,
+            num_layers=nlayers,
+            nonlinearity="tanh",
+            batch_first=True,                         # ожидаем [B, T, F]
+            dropout=dropout if nlayers > 1 else 0.0,
+            bidirectional=False                       # для онлайна — только каузально
+        )
+        self.out_dim = hidden
+
+    def forward(self, x):                              # x: [B, T, F]
+        y, h = self.rnn(x)                             # h: [num_layers, B, hidden]
+        h_last = h[-1]                                 # [B, hidden]
+        return h_last
+
+class LSTMBackbone(nn.Module):
+    def __init__(self, feat_dim, hidden=64, nlayers=1, dropout=0.1, bidirectional=False):
+        super().__init__()
+        self.bidirectional = bool(bidirectional)
+        self.lstm = nn.LSTM(
+            input_size=feat_dim,
+            hidden_size=hidden,
+            num_layers=nlayers,
+            batch_first=True,                     # ожидаем [B, T, F]
+            dropout=dropout if nlayers > 1 else 0.0,
+            bidirectional=self.bidirectional
+        )
+        self.out_dim = hidden * (2 if self.bidirectional else 1)
+
+    def forward(self, x):                          # x: [B, T, F]
+        y, (h, c) = self.lstm(x)                   # h: [layers*(1/2), B, hidden]
+        if not self.bidirectional:
+            return h[-1]                           # [B, hidden]
+        else:
+            # последний слой: concat (fw, bw)
+            return T.cat([h[-2], h[-1]], dim=-1)   # [B, 2*hidden]
+
 # ===========================
 # Networks
 # ===========================
@@ -482,41 +528,89 @@ class TransformerBackbone(nn.Module):
         return self.norm(x[:, -1, :])
 
 class ActorNetwork(nn.Module):
-    def __init__(self, input_dims, lr, d_model=32, nhead=4, nlayers=2, dropout=0.1, chkpt_dir='tmp/'):
+    def __init__(self, input_dims, lr, d_model=32, nhead=4, nlayers=2, dropout=0.1,
+                 backbone="transformer", lstm_hidden=64, lstm_layers=1, chkpt_dir='tmp/'):
         super().__init__()
-        self.checkpoint_file = os.path.join(chkpt_dir, 'actor_cont_cont_trx')
+        self.checkpoint_file = os.path.join(chkpt_dir, 'actor_cont_multi')
         feat_dim = int(input_dims[-1]) if isinstance(input_dims, (tuple, list, np.ndarray)) else int(input_dims)
-        self.backbone = TransformerBackbone(feat_dim, d_model, nhead, nlayers, dropout)
-        self.fc_mu = nn.Linear(d_model, 1)
-        self.fc_logstd  = nn.Linear(d_model, 1)
-        self.log_std = nn.Parameter(T.zeros(1, 1))
+
+        self.backbone, out_dim = self._make_backbone(
+            feat_dim, backbone, d_model, nhead, nlayers, dropout, lstm_hidden, lstm_layers
+        )
+        self.fc_mu     = nn.Linear(out_dim, 1)
+        self.log_std   = nn.Parameter(T.zeros(1, 1))
+
         self.optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
         self.to(self.device)
-    def forward(self, state_seq):
-        h = self.backbone(state_seq)
+
+    def _make_backbone(self, feat_dim, backbone, d_model, nhead, nlayers, dropout, lstm_hidden, lstm_layers):
+        b = str(backbone).lower()
+        if b == "transformer":
+            bb = TransformerBackbone(feat_dim, d_model, nhead, nlayers, dropout)
+            out_dim = d_model
+        elif b == "rnn":
+            bb = SimpleRNNBackbone(feat_dim, hidden=lstm_hidden, nlayers=lstm_layers, dropout=dropout)
+            out_dim = bb.out_dim
+        elif b == "lstm":
+            bb = LSTMBackbone(feat_dim, hidden=lstm_hidden, nlayers=lstm_layers, dropout=dropout, bidirectional=False)
+            out_dim = bb.out_dim
+        elif b == "bilstm":
+            bb = LSTMBackbone(feat_dim, hidden=lstm_hidden, nlayers=lstm_layers, dropout=dropout, bidirectional=True)
+            out_dim = bb.out_dim
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+        return bb, out_dim
+
+    def forward(self, state_seq):                 # state_seq: [B, T, F]
+        h = self.backbone(state_seq)             # [B, D]
         mu = T.tanh(self.fc_mu(h))
         sigma = F.softplus(self.log_std) + 1e-4
         return T.distributions.Normal(mu, sigma)
+
     def save_checkpoint(self): T.save(self.state_dict(), self.checkpoint_file)
     def load_checkpoint(self): self.load_state_dict(T.load(self.checkpoint_file, map_location=self.device))
 
 class CriticNetwork(nn.Module):
-    def __init__(self, input_dims, lr, d_model=32, nhead=4, nlayers=2, dropout=0.1, chkpt_dir='tmp/'):
+    def __init__(self, input_dims, lr, d_model=32, nhead=4, nlayers=2, dropout=0.1,
+                 backbone="transformer", lstm_hidden=64, lstm_layers=1, chkpt_dir='tmp/'):
         super().__init__()
-        self.checkpoint_file = os.path.join(chkpt_dir, 'critic_cont_trx')
+        self.checkpoint_file = os.path.join(chkpt_dir, 'critic_cont_multi')
         feat_dim = int(input_dims[-1]) if isinstance(input_dims, (tuple, list, np.ndarray)) else int(input_dims)
-        self.backbone = TransformerBackbone(feat_dim, d_model, nhead, nlayers, dropout)
-        self.fc_value = nn.Linear(d_model, 1)
+
+        self.backbone, out_dim = self._make_backbone(
+            feat_dim, backbone, d_model, nhead, nlayers, dropout, lstm_hidden, lstm_layers
+        )
+        self.fc_value = nn.Linear(out_dim, 1)
+
         self.optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
         self.to(self.device)
-    def forward(self, state_seq):
-        h = self.backbone(state_seq)
+
+    def _make_backbone(self, feat_dim, backbone, d_model, nhead, nlayers, dropout, lstm_hidden, lstm_layers):
+        b = str(backbone).lower()
+        if b == "transformer":
+            bb = TransformerBackbone(feat_dim, d_model, nhead, nlayers, dropout)
+            out_dim = d_model
+        elif b == "rnn":
+            bb = SimpleRNNBackbone(feat_dim, hidden=lstm_hidden, nlayers=lstm_layers, dropout=dropout)
+            out_dim = bb.out_dim
+        elif b == "lstm":
+            bb = LSTMBackbone(feat_dim, hidden=lstm_hidden, nlayers=lstm_layers, dropout=dropout, bidirectional=False)
+            out_dim = bb.out_dim
+        elif b == "bilstm":
+            bb = LSTMBackbone(feat_dim, hidden=lstm_hidden, nlayers=lstm_layers, dropout=dropout, bidirectional=True)
+            out_dim = bb.out_dim
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+        return bb, out_dim
+
+    def forward(self, state_seq):                 # state_seq: [B, T, F]
+        h = self.backbone(state_seq)             # [B, D]
         return self.fc_value(h)
+
     def save_checkpoint(self): T.save(self.state_dict(), self.checkpoint_file)
     def load_checkpoint(self): self.load_state_dict(T.load(self.checkpoint_file, map_location=self.device))
-
 
 # PPO Agent
 # ===========================
@@ -550,7 +644,7 @@ class Agent:
         self.critic_sched = optim.lr_scheduler.CosineAnnealingLR(self.critic.optimizer, T_max=200)
 
         # гистерезис для инференса/выбора экшна
-        self.TAU_ENTER, self.TAU_EXIT = 0.12, 0.04
+        self.TAU_ENTER, self.TAU_EXIT = 0.05, 0.02
         self.policy_pos_cache = 0.0
 
     def remember(self, state_seq, action, log_prob, value, reward, done):
@@ -674,6 +768,7 @@ class Agent:
 
         self.learn_calls += 1
         self.memory.clear_memory()
+
 # ===========================
 # Training loop (curriculum)
 # ===========================
@@ -681,20 +776,30 @@ def make_env_slice(df_full, start_idx, end_idx, episode_len=None, randomize=True
     df_slice = df_full.iloc[start_idx:end_idx].reset_index(drop=True).copy()
     return StockTradingEnv(df_slice, episode_len=episode_len, randomize=randomize, lag=lag)
 
-
 env = StockTradingEnv(df_train)
+
+# агент
 agent = Agent(
     n_actions=1,
     input_dims=env.observation_space.shape,
-    lr=1e-3,
+    lr=5e-4,            # было 7e-4
     batch_size=512,
-    n_epochs=10,
-    entropy_coef=0.06,
+    n_epochs=12,        # было 10
+    entropy_coef=0.05,
     policy_clip=0.30,
     target_kl=0.08,
     max_grad_norm=0.9,
     gae_lambda=0.97
 )
+
+# головы LSTM
+agent.actor  = ActorNetwork(env.observation_space.shape, lr=5e-4,
+                            backbone="lstm", lstm_hidden=96, lstm_layers=2, dropout=0.15)
+agent.critic = CriticNetwork(env.observation_space.shape, lr=5e-4,
+                             backbone="lstm", lstm_hidden=96, lstm_layers=2, dropout=0.15)
+
+# (опционально) если окно у тебя длинное, для RNN лучше так:
+# SEQ_LEN = 24 ~ 32
 
 stages = [
     ("stage1", 0,   900,              600),
@@ -772,275 +877,222 @@ for name, s, e, n_games in stages:
               f"| PnL ${pnl: .2f} | Equity ${equity: .2f} "
               f"| winrate {wr:.1%} | zero% {zero_ratio: .1f}")
 
-# ===========================
-# Inference (test) + Backtest (boosted, aligned)
-# ===========================
-from collections import deque
+# --- INFERENCE v2: RAW gates = env + breakout + chandelier exit + 3-level exposure ---
 
-TEST_START = "2022-01-01"
-TEST_END   = "2024-12-31"
+infer_model = agent.actor; infer_model.eval()
 
-# --- грузим лучшие веса ---
-loaded_actor = loaded_critic = False
-try:
-    agent.actor.load_checkpoint(); loaded_actor = True
-    print("Loaded best actor:", agent.actor.checkpoint_file)
-except Exception as e:
-    print("WARN actor:", e)
+# работаем на тестовом окне (сохраняем индексы для выравнивания)
+rep = df_test.copy()                    # стандартизованные фичи + Close_Price/RAW-поля
+raw = test_raw.reset_index(drop=True)   # СЫРЫЕ цены High/Low/Close/Volume и т.д.
+if len(raw) != len(rep):
+    raw = raw.iloc[-len(rep):].reset_index(drop=True)
 
-try:
-    agent.critic.load_checkpoint(); loaded_critic = True
-    print("Loaded best critic:", agent.critic.checkpoint_file)
-except Exception as e:
-    print("WARN critic:", e)
+# быстрые векторы (RAW)
+px    = raw["Close"].to_numpy(float)
+hi    = raw["High"].to_numpy(float)
+lo    = raw["Low"].to_numpy(float)
 
-infer_model  = agent.actor.eval()
-critic_model = agent.critic.eval()
+e20   = rep["EMA20_RAW"].to_numpy(float)
+e50   = rep["EMA50_RAW"].to_numpy(float)
+adx   = rep["ADX_RAW"].to_numpy(float)
 
-reporting_df = df_test.reset_index(drop=True).copy()
+# волатильность и ATR%
+prev_close = np.r_[px[0], px[:-1]]
+tr = np.maximum.reduce([hi-lo, np.abs(hi-prev_close), np.abs(lo-prev_close)])
+atr = pd.Series(tr).rolling(14).mean().bfill().to_numpy(float)
+atrp = (atr / np.maximum(px, 1e-12)).astype(float)
 
-# --- согласуем размер входа ---
-expected_F = infer_model.backbone.proj.in_features
-have_F     = len(feat_cols) + 1  # + long_short_ratio
-if expected_F == have_F:
-    feat_cols_infer = feat_cols[:]
-elif expected_F == have_F - 1:
-    tmp = [c for c in feat_cols if c != "ADX"] if "ADX" in feat_cols else feat_cols[:-1]
-    if len(tmp) + 1 != expected_F: tmp = tmp[: expected_F - 1]
-    feat_cols_infer = tmp
-else:
-    raise ValueError(f"Model expects F={expected_F}, got {have_F}")
+# Donchian breakout (shift(1) — без заглядывания вперёд)
+L_break, L_trail = 55, 20
+don_hi = pd.Series(px).rolling(L_break).max().shift(1).to_numpy()
+don_lo = pd.Series(px).rolling(L_trail).min().shift(1).to_numpy()
 
-# --- волатильность для таргетинга ---
-lag = 20
-test_rets = reporting_df["Close_Price"].pct_change().fillna(0.0)
-test_vol  = test_rets.rolling(lag).std().fillna(test_rets.std())
-vol_med   = float(np.nanmedian(test_vol.values))
+# вспомогательная волатильность для вол-таргета
+ret   = pd.Series(px).pct_change().fillna(0.0).to_numpy(float)
+vol20 = pd.Series(ret).rolling(20).std().fillna(ret.std()).to_numpy(float)
 
-# ====== ручки (под цель ~14%) ======
-MICRO_DEADZONE   = True
-TAU_IN, TAU_OUT  = 0.03, 0.01
-ACTION_GAIN      = 1.30
-SMOOTH_ALPHA     = 0.25
+# ==== параметры инференса (подкручены под 2022–2024 AAPL) ====
+# гейты — как в env
+STRONG_ADX            = 25.0     # сильный тренд может «перебить» фильтр SMA200
+# deadzone/гистерезис + вол-таргетинг
+TAU_ENTER, TAU_EXIT   = 0.10, 0.04
+TARGET_DAILY_VOL_INF  = 0.050    # ↑ экспозицию (можно 0.048–0.055)
+ALPHA_SOFT            = 0.60
+# квантование экспозиции
+Q0, Q1                = 0.18, 0.34
+# chandelier exit
+CE_MULT               = 2.2      # множитель ATR% от пика; 2.0–2.6 — зона подстройки
+# удержание/фрикция
+MIN_HOLD              = 11       # минимум баров удержания после смены
+STEP_FRICTION         = 0.50     # менять позицию, только если шаг ≥ 0.5
+LONG_ONLY             = True
 
-GATE_EXP         = 0.65
-GATE_FLOOR       = 0.35
+positions   = []
+state_window= deque(maxlen=SEQ_LEN)
+raw_smooth  = 0.0
+pol_cache   = 0.0
+last_sign, hold = 0, 0
 
-TARGET_BOOST     = 1.00   # +100% к target при gate≈1 и сильном ADX
-LOW_VOL_UP       = 1.10   # при «тихой» воле повышаем target
-HIGH_VOL_DOWN    = 0.90   # при бурной воле понижаем target
+in_long     = False
+entry_px    = 0.0
+peak_px     = 0.0
+last_q      = 0.0
 
-USE_TREND_LEVER  = True
-TREND_LEVER_COEF = 0.45
-LEVER_MAX        = LEVER_CAP
-
-USE_BASELINE_BLEND  = True
-BASELINE_BLEND_COEF = 0.08
-
-MIN_HOLD_BASE    = getattr(env, "min_hold", 7)
-MIN_HOLD_STRONG  = 3
-
-USE_CONF_GATE    = bool(loaded_critic)   # только если критик реально загрузился
-CONF_GATE_WEAK_TH   = -0.005
-CONF_GATE_STRONG_TH = -0.03
-
-STICKY_DPOS_TH   = 0.03   # игнорируем слишком мелкие изменения позы
-
-# --------- подготовка ---------
-positions    = []
-state_window = deque(maxlen=SEQ_LEN)
-longs = shorts = 0
-pol_cache  = 0.0
-last_sign  = 0
-hold_clock = 0
-prev_eff   = 0.0
-
-def make_obs(step, ls_ratio: float):
-    core = reporting_df.reindex(columns=feat_cols_infer).iloc[step].astype(float).to_numpy()
-    obs  = np.concatenate([core.astype(np.float32), np.array([ls_ratio], dtype=np.float32)])
-    return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-
-# предзаполняем окно
-prewarm = min(SEQ_LEN-1, len(reporting_df))
 with T.no_grad():
-    for step in range(prewarm):
-        den = max(1, longs + shorts)
-        ls_ratio = float(longs) / den
-        state_window.append(make_obs(step, ls_ratio))
-        positions.append(0.0)
+    for t in range(len(rep)):
+        r = rep.iloc[t]
 
-# основной цикл
-with T.no_grad():
-    for step in range(prewarm, len(reporting_df)):
-        den = max(1, longs + shorts)
-        ls_ratio = float(longs) / den
-        state_window.append(make_obs(step, ls_ratio))
+        # === сформируем наблюдение в ТОМ ЖЕ порядке, что в env._next_observation() ===
+        core = r.reindex(feat_cols).astype(float).to_numpy(dtype=np.float32)
+        obs  = np.concatenate([core, np.array([0.0], dtype=np.float32)])  # ls_ratio онлайном не знаем
+        obs  = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
-        state_seq = np.asarray(state_window, dtype=np.float32)[None, ...]
-        state_t   = T.tensor(state_seq, dtype=T.float32, device=infer_model.device)
+        state_window.append(obs)
+        if len(state_window) < SEQ_LEN:
+            positions.append(0.0)
+            continue
 
-        # детерминированное действие (mean)
-        dist = infer_model(state_t)
-        raw  = float(dist.mean.squeeze().cpu().numpy())
-        raw *= ACTION_GAIN
-        raw  = float(np.clip(raw, -1.0, 1.0))
+        seq  = np.stack(state_window, axis=0)[None, ...].astype(np.float32)
+        dist = infer_model(T.tensor(seq, dtype=T.float32, device=infer_model.device))
+        mu   = float(T.clamp(dist.mean, -1.0, 1.0).squeeze().cpu().numpy())
 
-        # микро-дедзона
-        if MICRO_DEADZONE:
-            if pol_cache == 0.0:
-                if abs(raw) < TAU_IN:  raw = 0.0
+        # --- сглаживание + deadzone/hysteresis ---
+        raw_smooth = 0.85*raw_smooth + 0.15*mu
+        x = raw_smooth
+        if pol_cache == 0.0:
+            if abs(x) < TAU_ENTER: x = 0.0
+        else:
+            if abs(x) < TAU_EXIT:  x = 0.0
+        pol_cache = x
+
+        # --- волатильностной скейлинг ---
+        s_full = TARGET_DAILY_VOL_INF / max(float(vol20[t]), 1e-6)
+        scale  = ALPHA_SOFT*s_full + (1-ALPHA_SOFT)*min(1.0, s_full)
+        eff    = float(np.clip(x * scale, -1.0, 1.0))
+
+        # --- RAW-гейты как в среде ---
+        ema_gap   = abs(e20[t] - e50[t]) / max(abs(px[t]), 1e-6)
+        trend_dir = 1.0 if e20[t] >= e50[t] else -1.0
+
+        if (adx[t] < TRADE_ADX_MIN) or (ema_gap < EMA_GAP_MIN):
+            eff = 0.0
+
+        gate = float(np.clip((adx[t] - ADX_ENTER) / max(ADX_FULL - ADX_ENTER, 1e-6), 0.0, 1.0))
+        eff *= (0.3 + 0.7*gate)
+        if eff * trend_dir < 0:
+            eff *= (1.0 - 0.5*gate)
+        ts = float(np.clip(adx[t] / 50.0, 0.0, 1.0))
+        eff = float(np.clip(eff * (0.5 + 0.5*ts), -1.0, 1.0))
+
+        # --- breakout условие: ап-тренд + пробой Дончиана + ADX растёт ---
+        adx_up     = (t > 0) and (adx[t] > adx[t-1])
+        breakoutUp = (px[t] > (don_hi[t] if not np.isnan(don_hi[t]) else -np.inf)) and (trend_dir > 0) and adx_up
+
+        # --- Long-only режим c сильным трендом ---
+        sma200 = pd.Series(px).rolling(200).mean().to_numpy()
+        bull   = (px >= np.nan_to_num(sma200, nan=np.inf))  # до заполнения SMA200 считаем flat=False
+        if LONG_ONLY:
+            if trend_dir < 0:
+                eff = 0.0
             else:
-                if abs(raw) < TAU_OUT: raw = 0.0
-            pol_cache = raw
+                if (not bull[t]) and (adx[t] < STRONG_ADX):
+                    eff = 0.0
+            eff = max(0.0, eff)
 
-        # confidence-gate (если критик есть)
-        if USE_CONF_GATE:
-            V = float(critic_model(state_t).item())
-            if V < CONF_GATE_WEAK_TH and abs(raw) < 0.20:
-                raw = 0.0
-            elif V < CONF_GATE_STRONG_TH and abs(raw) >= 0.20:
-                raw *= 0.5
+        # --- квантование базовой экспозиции ---
+        if eff <= Q0:
+            q_base = 0.0
+        elif eff <= Q1:
+            q_base = 0.5
+        else:
+            q_base = 1.0
 
-        # RAW и тренд-метрики
-        adx     = float(reporting_df.loc[step, "ADX_RAW"])
-        ema20   = float(reporting_df.loc[step, "EMA20_RAW"])
-        ema50   = float(reporting_df.loc[step, "EMA50_RAW"])
-        closepx = float(reporting_df.loc[step, "Close_Price"])
-        ema_gap = abs(ema20 - ema50) / max(abs(closepx), 1e-6)
+        # breakout усиливает экспозицию
+        q = max(q_base, 1.0 if breakoutUp else q_base)
 
-        gate_trend = float(np.clip((adx - ADX_ENTER) / max(ADX_FULL - ADX_ENTER, 1e-6), 0.0, 1.0))
-        ts = float(np.clip(adx / 50.0, *TREND_STRENGTH_CLIP))
-        trend_dir = 1.0 if ema20 >= ema50 else -1.0
+        # --- фрикция изменения позиции ---
+        if abs(q - last_q) < STEP_FRICTION:
+            q = last_q
 
-        # динамический таргет-вол
-        target_dyn = TARGET_DAILY_VOL * (1.0 + TARGET_BOOST * gate_trend * ts)
-        curr_vol   = max(float(test_vol.iloc[step]), 1e-6)
-        if curr_vol < 0.8 * vol_med:  target_dyn *= LOW_VOL_UP
-        elif curr_vol > 1.3 * vol_med: target_dyn *= HIGH_VOL_DOWN
-        scale   = soft_scale(curr_vol, target=target_dyn, alpha=0.5)
-        eff_pos = float(np.clip(raw * scale, -1.0, 1.0))
+        # --- Chandelier Exit от пика (в ATR%) ---
+        if q > 0.0:
+            if not in_long:
+                in_long = True; entry_px = px[t]; peak_px = px[t]
+            else:
+                peak_px = max(peak_px, px[t])
+                ce_floor = peak_px * (1.0 - CE_MULT * max(atrp[t], 1e-6))
+                if px[t] < ce_floor:
+                    q = 0.0
+                    in_long = False; last_sign = 0; hold = 0
+        else:
+            in_long = False
 
-        # мягкие гейты с полом
-        gate_adx = float(np.clip((adx - TRADE_ADX_MIN) / max(ADX_FULL - TRADE_ADX_MIN, 1e-6), 0.0, 1.0))
-        gate_gap = float(np.clip(ema_gap / max(EMA_GAP_MIN, 1e-12),                           0.0, 1.0))
-        g = max(GATE_FLOOR, (gate_adx * gate_gap) ** GATE_EXP)
-        eff_pos *= g
-
-        # ориентация по тренду и TREND_GATE
-        eff_pos *= (0.6 + 0.4 * gate_trend)
-        if eff_pos * trend_dir < 0:
-            eff_pos *= (1.0 - 0.5 * gate_trend)
-        if TREND_GATE:
-            eff_pos = float(np.clip(eff_pos * (0.5 + 0.5 * ts), -1.0, 1.0))
-
-        # лёгкий бленд с baseline (SMA20>50)
-        if USE_BASELINE_BLEND:
-            b_t = 1.0 if ema20 >= ema50 else 0.0
-            eff_pos = (1.0 - BASELINE_BLEND_COEF) * eff_pos + BASELINE_BLEND_COEF * b_t * trend_dir * gate_trend
-
-        # тренд-левередж (кап по LEVER_MAX)
-        if USE_TREND_LEVER:
-            conf = float(np.clip(0.5 * gate_trend + 0.5 * ts, 0.0, 1.0))
-            lever = 1.0 + TREND_LEVER_COEF * conf
-            eff_pos = float(np.clip(eff_pos * lever, -LEVER_MAX, LEVER_MAX))
-
-        # адаптивный min-hold
-        min_hold = MIN_HOLD_STRONG if gate_trend > 0.8 else MIN_HOLD_BASE
-        sign = 0 if abs(eff_pos) < 1e-6 else (1 if eff_pos > 0 else -1)
-        if sign == 0:
-            hold_clock += 1
+        # --- удержание после смены ---
+        s = int(q > 0.0)
+        if s == 0:
+            hold += 1
         else:
             if last_sign == 0:
-                last_sign = sign; hold_clock = 0
-            elif sign != last_sign and hold_clock < min_hold:
-                eff_pos = abs(eff_pos) * last_sign
-                sign = last_sign; hold_clock += 1
-            elif sign != last_sign and hold_clock >= min_hold:
-                last_sign = sign; hold_clock = 0
+                last_sign = 1; hold = 0
+            elif last_sign != 1 and hold < MIN_HOLD:
+                q = float(last_sign); s = last_sign; hold += 1
+            elif last_sign != 1 and hold >= MIN_HOLD:
+                last_sign = 1; hold = 0
             else:
-                hold_clock += 1
+                hold += 1
 
-        # «липкость» по дельте позы
-        if abs(eff_pos - prev_eff) < STICKY_DPOS_TH:
-            eff_pos = prev_eff
-
-        # сглаживание позы
-        eff_pos = SMOOTH_ALPHA * eff_pos + (1.0 - SMOOTH_ALPHA) * prev_eff
-        prev_eff = eff_pos
-
-        positions.append(eff_pos)
-        if eff_pos > 0: longs += 1
-        elif eff_pos < 0: shorts += 1
+        positions.append(q)
+        last_q = q
 
 # ===========================
-# Backtest (без изменений)
+# Backtest (как у тебя)
 # ===========================
-df_bt = reporting_df.copy()
-df_bt["Return"] = df_bt["Close_Price"].pct_change().fillna(0.0).clip(-0.12, 0.12)
+df_bt = rep.copy()
+df_bt["Return"]   = pd.Series(px).pct_change().fillna(0.0).to_numpy(float)
 
 pos = np.asarray(positions, dtype=float).ravel()
-N = len(df_bt)
-if len(pos) < N: pos = np.concatenate([np.zeros(N-len(pos)), pos])
+N   = len(df_bt)
+if len(pos) < N: pos = np.r_[np.zeros(N-len(pos)), pos]
 elif len(pos) > N: pos = pos[-N:]
 df_bt["Position"] = pos
-delta_pos = df_bt["Position"].diff().fillna(0.0)
 
-active_ret = (
-    df_bt["Position"].shift(1).fillna(0.0) * df_bt["Return"]
-    - (TURNOVER_COST + SLIPPAGE_BPS) * delta_pos.abs()
-)
+delta_pos = df_bt["Position"].diff().fillna(0.0)
+active_ret = df_bt["Position"].shift(1).fillna(0.0) * df_bt["Return"] \
+             - (TURNOVER_COST + SLIPPAGE_BPS) * delta_pos.abs()
 df_bt["PortRet"] = PERCENT_CAPITAL * active_ret
 df_bt["Equity"]  = (1.0 + df_bt["PortRet"]).cumprod()
 
-# Buy&Hold / метрики — как у тебя дальше
+# BH на Close
+price_full = (df["Adj Close"] if "Adj Close" in df.columns else df["Close"]).astype(float)
 
-# Buy&Hold
-price_full_series = (df["Adj Close"] if "Adj Close" in df.columns else df["Close"]).astype(float)
-bh_full = bh_curve_from_prices(price_full_series, PERCENT_CAPITAL)
-ROI_BH_FULL = (bh_full[-1] - 1.0) * 100.0
+bh_full    = bh_curve_from_prices(price_full, PERCENT_CAPITAL);       ROI_BH_FULL = (bh_full[-1]-1.0)*100
+bh_test    = bh_test_from_full(price_full, df_test, PERCENT_CAPITAL); ROI_BH_TEST = (bh_test[-1]-1.0)*100
+df_bt["Benchmark"] = bh_test
 
-test_dates = df.loc[TEST_START:TEST_END].index
-bh_test = bh_test_from_full(price_full_series, test_dates, PERCENT_CAPITAL)
-bh_series = pd.Series(bh_test)
-if len(bh_series) != len(df_bt):
-    if len(bh_series) > len(df_bt):
-        bh_series = bh_series.iloc[-len(df_bt):].reset_index(drop=True)
-    else:
-        pad = pd.Series([bh_series.iloc[0]] * (len(df_bt) - len(bh_series)))
-        bh_series = pd.concat([pad, bh_series], ignore_index=True)
-df_bt["Benchmark"] = bh_series.values
-ROI_BH_TEST = (df_bt["Benchmark"].iloc[-1] - 1.0) * 100.0
+# Бейзлайн
+sma20 = pd.Series(px).rolling(20).mean()
+sma50 = pd.Series(px).rolling(50).mean()
+base_pos = (sma20 > sma50).astype(float).fillna(0.0)
+b_delta  = base_pos.diff().fillna(0.0).abs()
+base_ret = base_pos.shift(1).fillna(0.0)*df_bt["Return"] - (TURNOVER_COST + SLIPPAGE_BPS)*b_delta
+df_bt["BaselineEq"] = (1.0 + PERCENT_CAPITAL * base_ret).cumprod()
 
-# Метрики
-def max_drawdown(arr_like):
-    x = np.asarray(arr_like, float)
-    peak = np.maximum.accumulate(x)
+# метрики
+ROI     = (df_bt["Equity"].iloc[-1]     - 1.0) * 100
+ROI_SB  = (df_bt["BaselineEq"].iloc[-1] - 1.0) * 100
+daily   = df_bt["PortRet"].to_numpy()
+sharpe  = (daily.mean() / (daily.std() + 1e-12)) * np.sqrt(252.0)
+def max_dd(x):
+    x = np.asarray(x, float); peak = np.maximum.accumulate(x)
     return float((x/peak - 1.0).min())
+mdd = max_dd(df_bt["Equity"])
 
-ROI    = (df_bt["Equity"].iloc[-1]    - 1.0) * 100.0
-ROI_SB = (df_bt["BaselineEq"].iloc[-1]- 1.0) * 100.0 if "BaselineEq" in df_bt else np.nan
-daily  = df_bt["PortRet"].to_numpy()
-eq     = df_bt["Equity"].to_numpy()
-sharpe = (daily.mean() / (daily.std() + 1e-12)) * np.sqrt(252.0)
-mdd    = max_drawdown(eq)
+coverage = float((df_bt["Position"] > 0).mean())
+turns    = float(df_bt["Position"].diff().abs().sum())
 
-pos_arr    = np.asarray(positions, float)
-zero_ratio = float(np.mean(np.isclose(pos_arr, 0.0)))
-mean_abs   = float(np.mean(np.abs(pos_arr)))
-
-blocked = 0
-for step in range(len(reporting_df)):
-    adx     = float(reporting_df.loc[step, "ADX_RAW"])
-    ema20   = float(reporting_df.loc[step, "EMA20_RAW"])
-    ema50   = float(reporting_df.loc[step, "EMA50_RAW"])
-    closepx = float(reporting_df.loc[step, "Close_Price"])
-    ema_gap = abs(ema20 - ema50) / max(abs(closepx), 1e-6)
-    if (adx < TRADE_ADX_MIN) or (ema_gap < EMA_GAP_MIN):
-        blocked += 1
-blocked_ratio = blocked / max(1, len(reporting_df))
-
-print(f"\nTEST {TEST_START}–{TEST_END}")
-print(f"Buy&Hold ROI (TEST):  {ROI_BH_TEST:.2f}%")
-print(f"Buy&Hold ROI (FULL):  {ROI_BH_FULL:.2f}%")
+print(f"\nTEST 2022–2024")
 print(f"Strategy ROI:         {ROI:.2f}% | Sharpe {sharpe:.2f} | MDD {mdd:.2%}")
-print(f"Diagnostics: zero_ratio={zero_ratio:.1%} | mean|pos|={mean_abs:.3f} | blocked={blocked_ratio:.1%}")
+print(f"Buy&Hold ROI (TEST):  {ROI_BH_TEST:.2f}% | Buy&Hold ROI (FULL): {ROI_BH_FULL:.2f}%")
+print(f"Smart Baseline ROI:   {ROI_SB:.2f}%")
+print(f"Coverage {coverage:.1%} | Turns {turns:.1f}")
+
