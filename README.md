@@ -50,34 +50,38 @@
 ## Project Structure
 
 ```
-repo/
-├─ news_score/                    # your news CSVs (see schema below)
+TRADING_AGENT3/
+├─ .venv/                     # local virtualenv (optional)
+├─ news_score/
+│  ├─ AMZN_score_last.csv
 │  ├─ Apple_news_score_last.csv
-│  ├─ MSFT_score_last.csv
-│  └─ ...
-├─ src/
-│  ├─ train.py                    # curriculum training loop (PPO)
-│  ├─ infer.py                    # inference & diagnostics per ticker
-│  ├─ data_prep.py                # yfinance download + feature engineering
-│  ├─ news_factors.py             # CSV → daily impacts → factor map
-│  ├─ markov.py                   # regime fit + posterior filter
-│  ├─ env.py                      # trading gym env + RMS wrappers
-│  └─ models.py                   # LSTM Actor/Critic, memory, agent
-├─ configs/                       # (optional) YAML for hyperparams
-│  └─ default.yaml
+│  ├─ GOOGLE_score_last.csv   # note: GOOGLE (not GOOGL)
+│  ├─ META_score_last.csv
+│  └─ MSFT_score_last.csv
+├─ tmp/                       # checkpoints/outputs created by the run
+├─ agent.py                   # main script (training + inference + diagnostics)
 ├─ requirements.txt
-├─ Dockerfile                     # optional (see below)
-├─ dvc.yaml                       # optional DVC pipeline
-├─ .dvcignore                     # optional DVC ignore
-└─ README.md
+├─ Dockerfile                 # container build (primary)
+├─ .dockerfile                # alt/legacy dockerfile (unused; keep or remove)
+├─ .dockerignore
+├─ .gitignore
+└─ Makefile                   # optional shortcuts (if used)
 ```
 
-> Your current code can live in a single script as well; the split above is a suggested refactor for maintainability.
+> This layout assumes a **single main script** (`agent.py`) that runs end‑to‑end (train → validate → inference). You can refactor into modules later if desired.
 
 ## Setup
 
 ### 1) Python
 
+````bash
+# Create and activate a local venv (recommended)
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
+# Install deps
+pip install --upgrade pip
+pip install -r requirements.txt
 ```bash
 # Create env (Conda shown; you can use venv instead)
 conda create -n rltrader python=3.11 -y
@@ -87,7 +91,7 @@ conda activate rltrader
 pip install -r requirements.txt
 # Minimal requirements include:
 # torch, numpy, pandas, yfinance, ta, scikit-learn, gym
-```
+````
 
 > **macOS M‑series**: prefer the official PyTorch install command for Metal if you want GPU‑acceleration; CPU works fine too.
 
@@ -131,45 +135,49 @@ dvc pull
 ### 3) (Optional) Docker
 
 ```bash
-# Build
-docker build -t rltrader:latest .
-# Run
-docker run --rm -it -v "$PWD:/work" -w /work rltrader:latest python src/train.py
+# Build (uses Dockerfile in repo root)
+docker build -t trading_agent3:latest .
+
+# Run, mounting the local folder so the script can see your news CSVs
+docker run --rm -it \
+  -v "$PWD:/app" \
+  -w /app \
+  trading_agent3:latest \
+  python agent.py
 ```
 
+**macOS tip**: if you see *Cannot connect to the Docker daemon*, open Docker Desktop first.bash
+
+# Build
+
+docker build -t rltrader:latest .
+
+# Run
+
+docker run --rm -it -v "$PWD:/work" -w /work rltrader:latest python src/train.py
+
+````
 **Common macOS fix**: if you see *Cannot connect to the Docker daemon*, open the Docker Desktop app first.
 
 ## Data: News CSV expectations
+The code expects CSVs inside **news_score/** with these file names (as in your repo):
 
-Your **news_score** CSVs can have flexible column names; the loader will try to auto‑detect. Minimum required fields (names may vary, see mapping below):
+- `Apple_news_score_last.csv`, `MSFT_score_last.csv`, `GOOGLE_score_last.csv`, `AMZN_score_last.csv`, `META_score_last.csv`
 
-* **date/time**: `date` | `datetime` | `pubDate` | `published_at` | `time` | `timestamp` (UTC or local; UTC preferred)
-* **title**: `title` | `headline`
-* **url**: `url` | `link`
-* **label** *(sentiment)*: `label` | `sentiment` | `class` | `polarity` → values mapped to `{bullish,bearish,neutral}`
-* *(optional)* **impact tier/weight**: `impact_tier` or `impact_strength`/`tier`; `impact_weight` or `weight`
-
-The pipeline will:
-
-1. Convert to **NY local time** and map each item to the **trading day** (T‑day) with post‑4pm rollover to next day.
-2. Deduplicate by `(trading_day, title_canon, domain)` keeping the *strongest* item.
-3. Aggregate per day → compute `ImpactSurprise` (EMA residual) and construct a **news factor** (1+k·tanh(x/scale)) clamped to ±`cap`.
+Column mapping is flexible; at minimum provide: date/time, title, url, and label (bullish/bearish/neutral). Optional: impact tier/weight. See details below if your columns differ.
 
 ## Quickstart
-
 ```bash
-# 1) Prepare news (paths are in code; adjust as needed)
-mkdir -p news_score
-# Put your CSVs into news_score/ (see Data section)
+# 1) Ensure news CSVs exist
+ls news_score/*.csv
 
-# 2) Train (curriculum + periodic validation + best checkpoint)
-python src/train.py
+# 2) Run the main script (does training + inference + prints ROI/Sharpe/MDD)
+python agent.py
 
-# 3) Inference on basket (uses best checkpoint if found)
-python src/infer.py --tickers AAPL MSFT GOOGL AMZN META \
-  --split test --attach-news --save-csv runs/bt/
-```
+# Outputs: checkpoints and optional CSVs under tmp/<run_id>/
+````
 
+If you want to skip training and only run inference with existing weights, adapt `agent.py` flags (if present) or set the booleans at the top of the script. (By default the script trains and then runs inference on the basket.)
 Outputs include per‑ticker ROI/Sharpe/MDD and an optional CSV with `Equity`, `Benchmark`, `Position`, and a `TopNewsAtChange` column.
 
 ## Training
@@ -187,21 +195,13 @@ Key hyperparameters (see code):
 
 ## Evaluation & Inference
 
-```bash
-# Single ticker
-env PYTHONPATH=src python src/infer.py --ticker NVDA --split test --csv out/nvda_bt.csv
+After the run, check the console for per‑ticker metrics like:
 
-# Basket + calibrated news k (per ticker)
-python src/infer.py --tickers AAPL MSFT ... --calibrate-k
-```
+* **ROI** `(Equity[-1]-1)*100`
+* **Sharpe** daily mean/std × √252
+* **MDD** min drawdown of equity
 
-What you get:
-
-* **ROI**: `(Equity[-1]-1)*100`.
-* **Sharpe**: daily mean/std × √252.
-* **MDD**: min of `Equity/peak - 1`.
-* **Benchmark**: buy‑and‑hold curve on the same date range.
-* **Top news at position changes** to inspect narrative triggers.
+CSV backtests may be written under `tmp/<run_id>/bt_<TICKER>.csv` if enabled in `agent.py` (search for `to_csv`).
 
 ## Configuration & Toggles
 
@@ -232,15 +232,15 @@ git push origin feat/ppo-news-markov
 
 ## Troubleshooting
 
-* **Docker**: `Cannot connect to the Docker daemon` → start Docker Desktop on macOS, or `sudo service docker start` on Linux.
-* **DVC**: files “push to DagsHub” vs “Git remote” confusion → remember to run **both** `git push` and `dvc push`. Use `dvc remote list` to verify remotes; `dvc pull` to download.
-* **Git push rejected** (`fetch first`) → `git pull --rebase`, resolve conflicts, retry.
-* **OpenAI key not set** → make sure `.env` is loaded (e.g., `python-dotenv`) and **do not** hardcode keys in source. Verify with:
+* **Docker**: `Cannot connect to the Docker daemon` → start Docker Desktop (macOS) or `sudo service docker start` (Linux).
+* **Requirements build error during `pip install -r requirements.txt` in Docker**: make sure `requirements.txt` lists compatible versions for your Python base image. Rebuild with `--no-cache` if you tweaked it.
+* **News file path mismatch**: the code uses `news_score/GOOGLE_score_last.csv` (GOOGLE, not GOOGL). Ensure names match exactly.
+* **Git push rejected (fetch first)**: `git pull --rebase origin main`, resolve conflicts, then `git push`.
+* **OpenAI key not set (if you use LLM scoring elsewhere)**: load `.env` properly (do not hardcode keys). Verify:
 
   ```python
-  import os; from dotenv import load_dotenv; load_dotenv(); print(bool(os.getenv("OPENAI_API_KEY")))
+  import os; from dotenv import load_dotenv; load_dotenv(); print(bool(os.getenv('OPENAI_API_KEY')))
   ```
-* **Missing columns in news CSV** → see *Data* mapping; the loader attempts reasonable defaults.
 
 ## Roadmap
 
@@ -262,3 +262,4 @@ TBD (MIT/Apache‑2.0 recommended for research templates).
 If you use this repo in academic work, please cite it informally as:
 
 > *Universal RL Trader with News and Markov Regimes* (2025). Research template implementing LSTM‑PPO with news factors and regime adaptation.
+
