@@ -163,16 +163,15 @@ class ObsRewNormWrapper(gym.Wrapper):
 def wrap_env_with_rms(env, obs_rms: RunningMeanStd, rew_rms: RunningMeanStd, training: bool = True):
     """Удобная функция-обёртка — как ты использовал."""
     return ObsRewNormWrapper(env, obs_rms=obs_rms, rew_rms=rew_rms, training=training)
-
 # ===========================
 # Data
 # ===========================
 df = yf.download("AAPL", start="2017-01-01", end="2025-01-01", auto_adjust=False)
 df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 df = df.sort_index()
-
 train_df = df.loc["2017-01-01":"2021-12-31"].copy()
-test_df  = df.loc["2022-01-01":"2024-12-31"].copy()
+val_df   = df.loc["2022-01-01":"2022-12-31"].copy()
+test_df  = df.loc["2023-01-01":"2024-12-31"].copy()
 
 def add_features(ddf: pd.DataFrame) -> pd.DataFrame:
     ddf = ddf.copy()
@@ -239,6 +238,7 @@ def add_features(ddf: pd.DataFrame) -> pd.DataFrame:
 
     return ddf
 train_df = add_features(train_df)
+val_df   = add_features(val_df)
 test_df  = add_features(test_df)
 
 BASE_FEAT_COLS = [
@@ -248,38 +248,35 @@ BASE_FEAT_COLS = [
     "BB_width","BB_pos",
     "RET1","RET5","RET20","ATR","ATR_PCT","VOL_REGIME",
     "VOL_Z","VOL_PCT",
-    # "ADX",  # <--- НЕ включаем, чтобы осталось 25 фич + 1 = 26
+    # "ADX",  # <--- НЕ включаем (оставляем 25 фич + 1 = 26)
 ]
 feat_cols = BASE_FEAT_COLS
 
-# 1) Сохраняем сырые фичи отдельно
+# === 3) сырые копии под каждый сплит ===
 train_raw = train_df.copy()
+val_raw   = val_df.copy()
 test_raw  = test_df.copy()
 
-# # 2) Стандартизируем ТОЛЬКО train на своих данных
-# train_std = rolling_standardize(train_raw, feat_cols, win=252)
-
-# # 3) Для test добавляем СЫРОЙ хвост из train_raw
-# tmp = pd.concat([train_raw.tail(252), test_raw], axis=0)
-# tmp_std = rolling_standardize(tmp, feat_cols, win=252)
-
-# # 4) Отрезаем обратно тест
-# test_std = tmp_std.iloc[252:].copy()
-# ТЕПЕРЬ (простая замена):
+# === 4) БЕЗ стандартизации (как у тебя сейчас) ===
 train_std = train_raw.copy()
+val_std   = val_raw.copy()
 test_std  = test_raw.copy()
 
-
-# 5) (опционально) очистка и клип
+# === 5) очистка/клип одинаково для всех сплитов ===
 CLIP_FEAT = 6.0
-for ddf in (train_std, test_std):
-    ddf[feat_cols] = (ddf[feat_cols]
-                      .replace([np.inf, -np.inf], np.nan)
-                      .fillna(0.0)
-                      .clip(-CLIP_FEAT, CLIP_FEAT))
+for ddf in (train_std, val_std, test_std):
+    ddf[feat_cols] = (
+        ddf[feat_cols]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .clip(-CLIP_FEAT, CLIP_FEAT)
+    )
 
+# === 6) финальные фреймы для env/inference ===
 df_train = train_std.reset_index(drop=True)
+df_val   = val_std.reset_index(drop=True)     # <--- валидация
 df_test  = test_std.reset_index(drop=True)
+
 def bh_curve_from_prices(price_series, pct_capital=1.0):
     px = np.asarray(price_series, dtype=float)
     ret = np.zeros_like(px, dtype=float)
@@ -349,7 +346,6 @@ class PPOMemory:
     def clear_memory(self):
         self.states.clear(); self.probs.clear(); self.actions.clear()
         self.rewards.clear(); self.dones.clear(); self.vals.clear()
-
 # === Volatility estimation (EWMA/rolling) ===
 VOL_MODE    = "ewma"   # "ewma" | "rolling"
 EWMA_SPAN_TRAIN = 20       # span для env
@@ -547,7 +543,6 @@ class StockTradingEnv(gym.Env):
 
     def render(self, mode='human', close=False):
         pass
-
 class SimpleRNNBackbone(nn.Module):
     def __init__(self, feat_dim, hidden=64, nlayers=1, dropout=0.1):
         super().__init__()
@@ -868,18 +863,21 @@ def make_env_slice(df_full, start_idx, end_idx, episode_len=None, randomize=True
                            episode_len=episode_len, randomize=randomize, lag=lag)
     return base  # <--- без RMS здесь
 
-# ====== ENV + RMS ======
-# общие RMS-статистики на весь тренинг (одни и те же на всех окнах)
+# ------------------------------------------------
+# 5) RMS-статистики на ВСЁ обучение (общие RMS)
+# ------------------------------------------------
 obs_rms = RunningMeanStd(shape=(len(feat_cols) + 1,), clip=8.0)  # +1 за long_short_ratio
 rew_rms = RunningMeanStd(shape=(), clip=8.0)
 
-# пробный обёрнутый env, только чтобы зафиксировать формы наблюдений
+# пробный враппер для фиксации shape наблюдений
 _probe_env = wrap_env_with_rms(StockTradingEnv(df_train), obs_rms, rew_rms, training=True)
 
-# ====== Agent ======
+# ===================================
+# 6) Agent c формой от ОБЁРНУТОГО env
+# ===================================
 agent = Agent(
     n_actions=1,
-    input_dims=_probe_env.observation_space.shape,  # <-- форма берётся у ОБЁРНУТОГО env
+    input_dims=_probe_env.observation_space.shape,
     lr=5e-4,
     batch_size=512,
     n_epochs=12,
@@ -890,37 +888,88 @@ agent = Agent(
     gae_lambda=0.97
 )
 
-# головы LSTM (тоже по форме обёрнутого env)
+# (Если ты хочешь LSTM-головы — переопределяем и шедулеры)
 agent.actor  = ActorNetwork(_probe_env.observation_space.shape, lr=5e-4,
                             backbone="lstm", lstm_hidden=96, lstm_layers=2, dropout=0.15)
 agent.critic = CriticNetwork(_probe_env.observation_space.shape, lr=5e-4,
                              backbone="lstm", lstm_hidden=96, lstm_layers=2, dropout=0.15)
+agent.actor_sched  = optim.lr_scheduler.CosineAnnealingLR(agent.actor.optimizer,  T_max=200)
+agent.critic_sched = optim.lr_scheduler.CosineAnnealingLR(agent.critic.optimizer, T_max=200)
 
-# (опц.) больше не нужен
-del _probe_env
+del _probe_env  # больше не нужен
 
-# ====== Curriculum / Walk-through ======
+# =======================================
+# 7) Валид. окружение с ТЕМИ ЖЕ RMS (fix)
+# =======================================
+base_env_val = StockTradingEnv(df_val, randomize=False)
+env_val = wrap_env_with_rms(base_env_val, obs_rms, rew_rms, training=False)
+
+# -----------------------------------------
+# 8) Helper: оценка на валидации (Sharpe/MDD)
+# -----------------------------------------
+def eval_agent_on_env(agent, env, episodes=2, eps_cov=1e-6):
+    sh_list, mdd_list, cov_list, turn_list = [], [], [], []
+    for _ in range(episodes):
+        obs = env.reset(); agent.state_window.clear()
+        done = False
+        daily_port = []
+        pos_prev = 0.0
+        turns_sum = 0.0
+        cover_cnt = 0
+        n_steps = 0
+
+        while not done:
+            action, _, _, _ = agent.choose_action(obs)   # без обучения
+            obs, reward, done, info = env.step(action)
+            realized_ret = float(info.get("realized_ret", 0.0))
+            eff_pos      = float(info.get("eff_position", 0.0))
+            daily_port.append(realized_ret * PERCENT_CAPITAL)
+            turns_sum += abs(eff_pos - pos_prev); pos_prev = eff_pos
+            cover_cnt += (abs(eff_pos) > eps_cov); n_steps += 1
+
+        r = np.asarray(daily_port, float)
+        sharpe = (r.mean() / (r.std() + 1e-12)) * np.sqrt(252.0)
+        eq = (1.0 + r).cumprod(); peak = np.maximum.accumulate(eq)
+        mdd = float((eq/peak - 1.0).min())
+        coverage = float(cover_cnt) / max(1, n_steps)
+        sh_list.append(sharpe); mdd_list.append(mdd); cov_list.append(coverage); turn_list.append(turns_sum)
+
+    sharpe = float(np.mean(sh_list))
+    mdd    = float(np.mean(mdd_list))
+    cov    = float(np.mean(cov_list))
+    turns  = float(np.mean(turn_list))
+    val_score = sharpe - 0.5 * abs(mdd)  # комбинированный критерий
+    return val_score, {"sharpe": sharpe, "mdd": mdd, "coverage": cov, "turns": turns}
+
+# =======================================
+# 9) Curriculum (как у тебя) + валидация
+# =======================================
+def make_env_slice(df_full, start_idx, end_idx, episode_len=None, randomize=True, lag=20):
+    df_slice = df_full.iloc[start_idx:end_idx].reset_index(drop=True).copy()
+    return StockTradingEnv(df_slice, episode_len=episode_len, randomize=randomize, lag=lag)
+
 stages = [
     ("stage1", 0,   900,              600),
     ("stage2", 300, 1200,             800),
     ("stage3", 0,   len(df_train),   2000),
 ]
 
-best_score = -1e9
+best_train_avg = -1e9      # best по скользящему среднему Reward/step
+best_val       = -1e9      # best по вал-скорингу
 score_history, n_steps = [], 0
+
+patience_val, stale_val = 6, 0     # ранняя остановка по валидации
 
 print("... starting aggressive curriculum ...")
 for name, s, e, n_games in stages:
-    # БАЗОВОЕ окно:
-    base_env = make_env_slice(df_train, s, e)  # даёт StockTradingEnv с нужным срезом
-    # ОБЯЗАТЕЛЬНО оборачиваем теми же obs_rms/rew_rms (training=True на обучении)
-    env = wrap_env_with_rms(base_env, obs_rms, rew_rms, training=True)
+    base_env = make_env_slice(df_train, s, e)
+    env = wrap_env_with_rms(base_env, obs_rms, rew_rms, training=True)  # train обновляет RMS
 
     window_len = (e - s)
     N = max(192, int(0.5 * window_len)) if name != "stage3" else max(256, int(0.6 * window_len))
 
-    patience, min_delta = 25, 0.0015
-    stale = 0
+    patience_train, min_delta = 25, 0.0015
+    stale_train = 0
     best_local = -1e9
 
     for i in range(n_games):
@@ -948,37 +997,56 @@ for name, s, e, n_games in stages:
 
             obs = obs_
 
-        steps_in_ep = max(1, env.unwrapped.episode_len)  # доступ к оригинальному env
+        steps_in_ep = max(1, env.unwrapped.episode_len)
         mean_score  = score / steps_in_ep
         score_history.append(mean_score)
         avg50 = float(np.mean(score_history[-50:]))
 
-        if avg50 > best_score:
-            best_score = avg50
+        if avg50 > best_train_avg:
+            best_train_avg = avg50
             agent.save_models()
 
         if avg50 > best_local + min_delta:
             best_local = avg50
-            stale = 0
+            stale_train = 0
         else:
-            stale += 1
-        if stale >= patience:
-            print(f"{name}: early stop (no improve {patience} eps), best_local={best_local:.4f}")
+            stale_train += 1
+        if stale_train >= patience_train:
+            print(f"{name}: early stop (no improve {patience_train} eps), best_local={best_local:.4f}")
             break
 
         zero_ratio = 100.0 * zero_act / max(1, total_act)
         wr = wins / max(1, wins + losses)
-
-        # берём метрики у исходного окружения под враппером
         pnl    = getattr(env.unwrapped, "net_profit", 0.0)
         equity = getattr(env.unwrapped, "available_balance", 0.0)
-
-        print(f"{name} | ep {i:4d} "
-              f"| mean {mean_score: .4f} "
-              f"| avg50 {avg50: .4f} "
-              f"| best {best_score: .4f} "
-              f"| PnL ${pnl: .2f} | Equity ${equity: .2f} "
+        print(f"{name} | ep {i:4d} | mean {mean_score: .4f} | avg50 {avg50: .4f} "
+              f"| best {best_train_avg: .4f} | PnL ${pnl: .2f} | Equity ${equity: .2f} "
               f"| winrate {wr:.1%} | zero% {zero_ratio: .1f}")
+
+        # --------- периодическая ВАЛИДАЦИЯ ---------
+        if (i + 1) % 50 == 0:
+            val_score, stats = eval_agent_on_env(agent, env_val, episodes=2)
+            print(f"[VAL] score={val_score:.3f} | Sharpe={stats['sharpe']:.2f} "
+                  f"| MDD={stats['mdd']:.2%} | Coverage={stats['coverage']:.1%} | Turns={stats['turns']:.1f}")
+
+            if val_score > best_val + 1e-3:
+                best_val = val_score
+                stale_val = 0
+                agent.save_models()  # чекпоинт по ЛУЧШЕЙ валидации
+                print("[VAL] ↑ new best checkpoint saved")
+            else:
+                stale_val += 1
+                if stale_val >= patience_val:
+                    print(f"[VAL] early stop: no improve {patience_val} checks; best={best_val:.3f}")
+                    break
+
+# ------------- финал: загрузить лучший по валидации перед тестом -------------
+try:
+    agent.actor.load_checkpoint()
+    agent.critic.load_checkpoint()
+    print("Loaded best checkpoint (by validation).")
+except Exception as e:
+    print("WARN: couldn't load best checkpoint ->", e)
 
 from typing import Optional
 
@@ -1255,4 +1323,3 @@ mdd = max_dd(df_bt["Equity"])
 print(f"\nTEST 2022–2024")
 print(f"Strategy ROI:         {ROI:.2f}% | Sharpe {sharpe:.2f} | MDD {mdd:.2%}")
 print(f"Buy&Hold ROI (TEST):  {ROI_BH_TEST:.2f}% | Buy&Hold ROI (FULL): {ROI_BH_FULL:.2f}%")
-
