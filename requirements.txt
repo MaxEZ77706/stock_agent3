@@ -1,0 +1,21 @@
+# use PyTorch CPU wheels; remove/adjust if you use GPU
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# core
+numpy
+pandas
+matplotlib
+scikit-learn
+
+# your project libs
+yfinance
+ta
+gym==0.26.2
+
+# dvc with DagsHub support
+dvc[dagshub]
+
+# (optional) torch stack
+torch
+torchvision
+torchaudio
