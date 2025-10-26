@@ -1,26 +1,49 @@
-# Data Preprocessing
+# ===========================
+# Imports
+# ===========================
+import os, math, random
+import numpy as np
 import pandas as pd
-from pandas_datareader.data import DataReader
-from ta.volume import VolumeWeightedAveragePrice
+import matplotlib.pyplot as plt
 
-# Environment
 import gym
 from gym import spaces
-import numpy as np
-import random
-import torch
 
-# PyTorch
-import os
-import numpy as np
 import torch as T
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions.categorical import Categorical
-import yfinance as yf
+import torch.nn.functional as F
 
-# Outputs
-import matplotlib.pyplot as plt
+import yfinance as yf
+from ta.volume import VolumeWeightedAveragePrice
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, EMAIndicator
+from ta.volatility import BollingerBands
+from sklearn.preprocessing import StandardScaler
+from collections import deque
+
+# ---- capital & costs ----
+PERCENT_CAPITAL  = 0.3# было 0.30 → снизить риск ×2
+TARGET_DAILY_VOL = 0.015       # было 0.020 → меньше плечо от волы
+TURNOVER_COST    = 0
+SLIPPAGE_BPS     = 0
+
+# ---- shape of reward ----
+WIN_REWARD    = 0.7            # было 1.0
+LOSS_PENALTY  = -0.7           # было -1.0
+WINLOSS_EPS   = 1e-4           # было 5e-5
+WINLOSS_Z     = 0.03           # было 0.02 → «мертвая зона» шире (меньше шумовых входов)
+INITIAL_ACCOUNT_BALANCE = 1000
+ALPHA_PNL     = 0.5           # было 0.9 → меньше веса «псевдо-PnL», меньше переобучения
+REWARD_CLIP   = 2.0            # было 3.0 → стабильнее обучение/оценка
+
+# ---- penalties ----
+SMOOTH_COST   = 5e-4           # было 2e-4 → дороже дерганье
+HOLD_COST     = 2e-4           # было 1e-5 → не стоим «на газу» без причины
+
+# ---- risk guard ----
+KILL_THRESH   = 0.40
+VOL_MODE      = "cap"
 
 # ===========================
 # Data download & features
@@ -28,172 +51,276 @@ import matplotlib.pyplot as plt
 df = yf.download("AAPL", start="2017-01-01", end="2025-01-01", auto_adjust=False)
 df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
-# Add VWAP to DataFrame
-vwap = VolumeWeightedAveragePrice(high=df["High"], low=df["Low"], close=df["Close"], 
-                                  volume=df["Volume"], window=14, fillna=False)
+vwap = VolumeWeightedAveragePrice(
+    high=df["High"], low=df["Low"], close=df["Close"],
+    volume=df["Volume"], window=14, fillna=False
+)
 df["VWAP"] = vwap.volume_weighted_average_price()
-df.dropna(inplace=True)
-df.head()
+df["RSI"]   = RSIIndicator(df["Close"], window=14).rsi()
+df["EMA20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
+df["EMA50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
 
-df_mod = df.copy()
+macd = MACD(df["Close"])
+df["MACD"]        = macd.macd()
+df["MACD_signal"] = macd.macd_signal()
 
-# проценты / нормализация
-rets = df_mod.pct_change() * 100
-rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
-
-scaled = rets / rets.max()   # или min-max
-# цена для графиков/анализа
-scaled["Close_Price"] = df.loc[scaled.index, "Close"].astype(float)
-
-df_mod = scaled   # тут сохраняется DatetimeIndex!
+bb = BollingerBands(df["Close"])
+df["BB_high"]  = bb.bollinger_hband()
+df["BB_low"]   = bb.bollinger_lband()
+df["BB_width"] = df["BB_high"] - df["BB_low"]
 
 
-df_mod = df.copy()
+ret1    = df["Close"].pct_change()
+vol20   = ret1.rolling(20).std()
+vol100  = ret1.rolling(100).std()
+ratio   = (vol20 / vol100).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0, 5.0)
 
-# проценты / нормализация
-rets = df_mod.pct_change() * 100
-rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+df["RET1"]       = ret1.fillna(0.0)
+df["ATR"]        = (df["High"] - df["Low"]).rolling(14).mean().fillna(0.0)
+df["VOL_REGIME"] = ratio
+df["Close_Price"] = df["Close"].astype(float)
 
-scaled = rets / rets.max()   # или min-max
-# цена для графиков/анализа
-scaled["Close_Price"] = df.loc[scaled.index, "Close"].astype(float)
+feat_cols = [
+    "Open","High","Low","Close","Volume","VWAP",
+    "RSI","EMA20","EMA50","MACD","MACD_signal","BB_width",
+    "RET1","ATR","VOL_REGIME"
+]
 
-df_mod = scaled   # тут сохраняется DatetimeIndex!
-
-df_train = df_mod.loc["2017-01-01":"2021-12-31"].copy()
-df_test  = df_mod.loc["2022-01-01":"2024-12-31"].copy()
-
-
-df_train_env = df_train.reset_index(drop=True).copy()
-df_test_env  = df_test.reset_index(drop=True).copy()
-
-# Initialise variables
-MAX_INT = 2147483647
-MAX_TRADES = 10000
-MAX_OPEN_POSITIONS = 1
-INITIAL_ACCOUNT_BALANCE = 1000
-PERCENT_CAPITAL = 0.3
-TRADING_COSTS_RATE = 0.001
-KILL_THRESH = 0.4 # Threshold for balance preservation
+train_df = df.loc["2017-01-01":"2021-12-31"].copy()  # тренировка
+test_df  = df.loc["2022-01-01":"2024-12-31"].copy()  # тест (ДОЛЖЕН остаться с DatetimeIndex!)
 
 
-# Structure environment
+scaler = StandardScaler().fit(train_df[feat_cols])
+train_std = train_df.copy()
+test_std  = test_df.copy()
+train_std[feat_cols] = scaler.transform(train_df[feat_cols])
+test_std[feat_cols]  = scaler.transform(test_df[feat_cols])
+
+# для модели и бэктеста стратегий удобно иметь RangeIndex:
+df_train = train_std.reset_index(drop=True)
+df_test  = test_std.reset_index(drop=True)
+
+# но ДЛЯ BH используем ровно тест с DatetimeIndex:
+test_df_bh = test_df 
+SEQ_LEN = 32
+
+# ===========================
+# Buy&Hold helpers (те же, что во втором коде)
+# ===========================
+def bh_curve_from_prices(price_series, alloc):
+    ret = price_series.astype(float).pct_change().fillna(0.0).to_numpy()
+    return (1.0 + alloc * ret).cumprod()
+
+def bh_test_from_full(price_full, df_test_like, alloc):
+    if isinstance(df_test_like.index, pd.DatetimeIndex) and isinstance(price_full.index, pd.DatetimeIndex):
+        price_test = price_full.loc[df_test_like.index].reset_index(drop=True)
+    else:
+        L = len(df_test_like)
+        price_test = price_full.iloc[-L:].reset_index(drop=True)
+    return bh_curve_from_prices(price_test, alloc)
+
+# единый источник цен для BH
+price_full = (df["Adj Close"] if "Adj Close" in df.columns else df["Close"]).astype(float)
+
+# единый alloc
+PERCENT_CAPITAL = globals().get("PERCENT_CAPITAL", 0.30)
+
+# считаем BH так же, как во втором коде
+bh_full = bh_curve_from_prices(price_full, PERCENT_CAPITAL)
+ROI_BH_FULL = (bh_full[-1] - 1.0) * 100.0
+
+bh_test = bh_test_from_full(price_full, test_df_bh, PERCENT_CAPITAL)  # ВАЖНО: по ДАТАМ!
+ROI_BH_TEST = (bh_test[-1] - 1.0) * 100.0
+
+
+import numpy as np
+import gym
+from gym import spaces
+
 class StockTradingEnv(gym.Env):
-    """A stock trading environment for OpenAI gym"""
-    metadata = {'render.modes': ['human']}
+    """Continuous-position trading env with adaptive win/loss reward."""
+    metadata = {"render.modes": ["human"]}
 
     def __init__(self, df):
-        super(StockTradingEnv, self).__init__()
-        
-        # Generic variables
-        self.df = df
-        
-        # Account variables
+        super().__init__()
+        self.df = df  # DataFrame: feat_cols + 'Close_Price'
+
+        # ---- счёт --\--
         self.available_balance = INITIAL_ACCOUNT_BALANCE
-        self.net_profit = 0
-        
-        # Position variables
+        self.net_profit = 0.0
+
+        # ---- счётчики ----
         self.num_trades_long = 0
         self.num_trades_short = 0
-        self.long_short_ratio = 0
-        
-        # Current Step
+        self.long_short_ratio = 0.0
+
+        # ---- время ----
         self.current_step = 0
         self.lag = 20
-        self.volatility = 1
         self.max_steps = len(df)
 
-        # Actions of the format Long, Hold, Close
-        self.action_space = spaces.Discrete(2)
+        # ---- action: позиция ∈ [-1, 1] ----
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
-        # Prices contains the Close and Close Returns etc
-        self.observation_space = spaces.Box(low=-1, high=1, shape=(7, ), dtype=np.float32)
+        # ---- observation: 16 признаков (15 фич + long_short_ratio) ----
+        feat_dim = 16
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf,
+                                            shape=(feat_dim,), dtype=np.float32)
 
-    # Calculate Reward
-    def _calculate_reward(self):
-        reward = 0
-        reward += self.net_profit / self.volatility
-        reward += 0.01 if self.long_short_ratio >= 0.3 and self.long_short_ratio <= 0.6 else -0.01
-        return reward
-        
-    # Structure sign observation data
+        # ---- волатильность для таргетинга и адаптивного порога ----
+        self.prev_position = 0.0
+        rets = self.df["Close_Price"].pct_change().fillna(0.0)
+        self.vol_series = rets.rolling(self.lag).std().fillna(rets.std())
+        self.volatility = float(self.vol_series.iloc[0]) if np.isfinite(self.vol_series.iloc[0]) else 1e-6
+
+        # ---- стоп по просадке ----
+        self.equity_peak = 1.0
+
+    # ---------- helpers ----------
     def _next_observation(self):
-        
-        item_0_T0 = self.df.loc[self.current_step - 0, "Open"].item()
-        item_1_T0 = self.df.loc[self.current_step - 0, "High"].item()       
-        item_2_T0 = self.df.loc[self.current_step - 0, "Low"].item()
-        item_3_T0 = self.df.loc[self.current_step - 0, "Close"].item()
-        item_4_T0 = self.df.loc[self.current_step - 0, "Volume"].item()
-        item_5_T0 = self.df.loc[self.current_step - 0, "VWAP"].item()
-        
-        env_4 = 1 if self.long_short_ratio else 0
-        
-        obs = np.array([item_0_T0, item_1_T0, item_2_T0, item_3_T0, item_4_T0, item_5_T0, env_4])
-        
-        return obs
+        row = self.df.loc[self.current_step]
+        obs = np.array([
+            float(row["Open"]),  float(row["High"]),  float(row["Low"]),
+            float(row["Close"]), float(row["Volume"]), float(row["VWAP"]),
+            float(row["RSI"]),   float(row["EMA20"]), float(row["EMA50"]),
+            float(row["MACD"]),  float(row["MACD_signal"]),
+            float(row["BB_width"]),
+            float(row["RET1"]),  float(row["ATR"]),   float(row["VOL_REGIME"]),
+            float(self.long_short_ratio),
+        ], dtype=np.float32)
+        return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Set the current price to a random price within the time step
     def _take_action(self, action):
-        current_price = self.df.loc[self.current_step, "Close_Price"].item()
-        next_price = self.df.loc[self.current_step + 1, "Close_Price"].item()
-        next_return = next_price / current_price - 1
-        
-        # Go Long
-        if action == 0:
-            self.net_profit += self.available_balance * PERCENT_CAPITAL * next_return
-            self.available_balance += self.net_profit
-            self.num_trades_long += 1
-                
-        # Go Short
-        if action == 1:
-            self.net_profit += self.available_balance * PERCENT_CAPITAL * -next_return
-            self.available_balance += self.net_profit
-            self.num_trades_short += 1
-        
-        # Update metrics
-        self.long_short_ratio = self.num_trades_long / (self.num_trades_long + self.num_trades_short)
-        self.volatility = self.df.loc[self.current_step - self.lag, "Close_Price"].sum()
-
-    # Execute one time step within the environment
-    def step(self, action):
-        self._take_action(action)
-
-        reward = self._calculate_reward()
+        position = float(action[0])
     
+        # доходность актива
+        if self.current_step + 1 >= self.max_steps:
+            asset_ret = 0.0
+        else:
+            p0 = float(self.df.loc[self.current_step, "Close_Price"])
+            p1 = float(self.df.loc[self.current_step + 1, "Close_Price"])
+            asset_ret = (p1 / max(p0, 1e-12)) - 1.0
+    
+        # волатильность
+        vol = float(self.vol_series.iloc[self.current_step]) if self.current_step < len(self.vol_series) else 0.0
+        self.volatility = vol if (np.isfinite(vol) and vol > 0) else 1e-6
+    
+        # вол-таргет
+        if VOL_MODE == "full":
+            scale = TARGET_DAILY_VOL / self.volatility
+        else:
+            scale = min(1.0, TARGET_DAILY_VOL / self.volatility)
+    
+        eff_position = float(np.clip(position * scale, -1.0, 1.0))
+    
+        # доходность сделки + сглаживание хвостов
+        raw_ret = eff_position * asset_ret
+        realized_ret = float(np.tanh(raw_ret / 0.01) * 0.01)
+            
+                # PnL на долю капитала
+        traded_cap = self.available_balance * PERCENT_CAPITAL
+        step_pnl   = traded_cap * realized_ret
+        self.net_profit        += step_pnl
+        self.available_balance += step_pnl
+    
+        # издержки за оборот
+        delta_pos    = eff_position - self.prev_position
+        turnover_fee = traded_cap * TURNOVER_COST * abs(delta_pos)
+        if turnover_fee > 0:
+            self.available_balance -= turnover_fee
+            self.net_profit        -= turnover_fee
+    
+        # счётчики long/short
+        if eff_position > 0: self.num_trades_long  += 1
+        if eff_position < 0: self.num_trades_short += 1
+        den = self.num_trades_long + self.num_trades_short
+        self.long_short_ratio = (self.num_trades_long / den) if den > 0 else 0.0
+    
+        return realized_ret, eff_position, delta_pos, raw_ret
+
+    def step(self, action):
+        realized_ret, eff_position, delta_pos, raw_ret = self._take_action(action)
+
+        # штрафы за дёрганье/удержание
+        smooth_pen = float(SMOOTH_COST * (delta_pos ** 2))
+        hold_pen   = float(HOLD_COST   * (eff_position ** 2))
+
+        # адаптивный порог win/loss: максимум из абсолютного минимума и «доли волатильности»
+        thr_abs = max(
+            WINLOSS_EPS,
+            WINLOSS_Z * self.volatility * (abs(eff_position) + 0.1)
+        )
+
+        # win/loss по «сырому» результату сделки
+        if   raw_ret >  thr_abs: base = WIN_REWARD
+        elif raw_ret < -thr_abs: base = LOSS_PENALTY
+        else:                    base = 0.0
+        
+        # смешиваем дискретную (base) и непрерывную (realized_ret) части
+        reward = base + ALPHA_PNL * realized_ret - smooth_pen - hold_pen
+
+
+        
+        # стабилизация дисперсии награды
+        
+        reward = float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
+
+
+
+        # обновляем позицию
+        self.prev_position = eff_position
+
+        # стоп по просадке
+        equity = self.available_balance / INITIAL_ACCOUNT_BALANCE
+        self.equity_peak = max(self.equity_peak, equity)
+        dd = equity / self.equity_peak - 1.0
+        hard_stop = (dd < -KILL_THRESH)
+
+        # время
         self.current_step += 1
-        
-        is_max_steps_taken = self.current_step >= self.max_steps - self.lag - 1
-        done = True if is_max_steps_taken else False
-        
-        obs = self._next_observation()
+        done = hard_stop or (self.current_step >= self.max_steps - 1)
 
-        return obs, reward, done, {}
+        info = {
+            "drawdown": float(dd),
+            "base_reward": float(base),
+            "thr_abs": float(thr_abs),
+            "raw_ret": float(raw_ret),
+            "realized_ret": float(realized_ret),
+            "vol": float(self.volatility),
+            "eff_position": float(eff_position),
+            "smooth_pen": float(smooth_pen),
+            "hold_pen": float(hold_pen),
+        }
+        return self._next_observation(), reward, done, info
 
-    # Reset the state of the environment to an initial state
-    def reset(self):
-        self.available_balance = INITIAL_ACCOUNT_BALANCE
-        self.net_profit = 0
+    def reset(self, start_balance=None):
+        # если передан баланс → стартуем с него
+        self.available_balance = float(start_balance) if start_balance is not None else INITIAL_ACCOUNT_BALANCE
+        self.net_profit = 0.0
         self.current_step = self.lag
         self.num_trades_long = 0
         self.num_trades_short = 0
-        self.num_trades_ratio = 0
-
+        self.long_short_ratio = 0.0
+        self.prev_position = 0.0
+        self.equity_peak = self.available_balance / INITIAL_ACCOUNT_BALANCE
+    
+        vol = float(self.vol_series.iloc[self.current_step]) if len(self.vol_series) > self.current_step else 1e-6
+        self.volatility = vol if (np.isfinite(vol) and vol > 0) else 1e-6
+    
         return self._next_observation()
 
-    # Render the environment to the screen
+
     def render(self, mode='human', close=False):
         pass
 
 
+# ===========================
+# PPO memory
+# ===========================
 class PPOMemory:
     def __init__(self, batch_size):
-        self.states = []
-        self.probs = []
-        self.vals = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-
+        self.states, self.probs, self.vals = [], [], []
+        self.actions, self.rewards, self.dones = [], [], []
         self.batch_size = batch_size
 
     def generate_batches(self):
@@ -203,16 +330,17 @@ class PPOMemory:
         np.random.shuffle(indices)
         batches = [indices[i:i+self.batch_size] for i in batch_start]
 
-        return np.array(self.states),\
-                np.array(self.actions),\
-                np.array(self.probs),\
-                np.array(self.vals),\
-                np.array(self.rewards),\
-                np.array(self.dones),\
-                batches
+        states_np = np.array(self.states, dtype=np.float32)
+        return (states_np,
+                np.array(self.actions, dtype=np.float32),
+                np.array(self.probs,   dtype=np.float32),
+                np.array(self.vals,    dtype=np.float32),
+                np.array(self.rewards, dtype=np.float32),
+                np.array(self.dones,   dtype=np.float32),
+                batches)
 
     def store_memory(self, state, action, probs, vals, reward, done):
-        self.states.append(state)
+        self.states.append(np.asarray(state, dtype=np.float32))
         self.actions.append(action)
         self.probs.append(probs)
         self.vals.append(vals)
@@ -220,343 +348,501 @@ class PPOMemory:
         self.dones.append(done)
 
     def clear_memory(self):
-        self.states = []
-        self.probs = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-        self.vals = []
+        self.states.clear(); self.probs.clear(); self.actions.clear()
+        self.rewards.clear(); self.dones.clear(); self.vals.clear()
+
+
+# ===========================
+# Networks
+# ===========================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=2048):
+        super().__init__()
+        pe = T.zeros(max_len, d_model)
+        pos = T.arange(0, max_len, dtype=T.float32).unsqueeze(1)
+        div = T.exp(T.arange(0, d_model, 2, dtype=T.float32) * (-math.log(10000.0)/d_model))
+        pe[:, 0::2] = T.sin(pos * div)
+        pe[:, 1::2] = T.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):  # [B,L,d]
+        return x + self.pe[:, :x.size(1), :]
+
+class TransformerBackbone(nn.Module):
+    def __init__(self, feat_dim, d_model=64, nhead=4, nlayers=2, dropout=0.1):
+        super().__init__()
+        self.proj = nn.Linear(feat_dim, d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=4*d_model,
+            dropout=dropout, batch_first=True, norm_first=True
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=nlayers)
+        self.posenc = PositionalEncoding(d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):           # [B,L,F]
+        x = self.proj(x)
+        x = self.posenc(x)
+        x = self.encoder(x)         # [B,L,d]
+        return self.norm(x[:, -1, :])
 
 
 class ActorNetwork(nn.Module):
-    def __init__(self, n_actions, input_dims, alpha,
-            fc1_dims=256, fc2_dims=256, chkpt_dir='tmp/'):
-        super(ActorNetwork, self).__init__()
+    def __init__(self, input_dims, lr, d_model=32, nhead=4, nlayers=2, dropout=0.1, chkpt_dir='tmp/'):
+        super().__init__()
+        self.checkpoint_file = os.path.join(chkpt_dir, 'actor_cont_cont_trx')
+        if isinstance(input_dims, (tuple, list, np.ndarray)):
+            feat_dim = int(input_dims[-1])
+        else:
+            feat_dim = int(input_dims)
+        self.backbone = TransformerBackbone(feat_dim, d_model, nhead, nlayers, dropout)
 
-        self.checkpoint_file = os.path.join(chkpt_dir, 'actor_torch_ppo') #Original V1 has some awesome weights
-        self.actor = nn.Sequential(
-                nn.Linear(*input_dims, fc1_dims),
-                nn.ReLU(),
-                nn.Linear(fc1_dims, fc2_dims),
-                nn.ReLU(),
-                nn.Linear(fc2_dims, n_actions),
-                nn.Softmax(dim=-1)
-        )
 
-        self.optimizer = optim.AdamW(self.parameters(), lr=alpha)
+        self.fc_mu = nn.Linear(d_model, 1)
+        self.log_std = nn.Parameter(T.zeros(1, 1))
+        self.optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
         self.to(self.device)
 
-    def forward(self, state):
-        dist = self.actor(state)
-        dist = Categorical(dist)
-        
-        return dist
+    def forward(self, state_seq):
+        h = self.backbone(state_seq)
+        mu = T.tanh(self.fc_mu(h))
+        sigma = F.softplus(self.log_std) + 1e-4
+        return T.distributions.Normal(mu, sigma)
 
-    def save_checkpoint(self):
-        T.save(self.state_dict(), self.checkpoint_file)
-
-    def load_checkpoint(self):
-        self.load_state_dict(T.load(self.checkpoint_file))
+    def save_checkpoint(self): T.save(self.state_dict(), self.checkpoint_file)
+    def load_checkpoint(self): self.load_state_dict(T.load(self.checkpoint_file))
 
 class CriticNetwork(nn.Module):
-    def __init__(self, input_dims, alpha, fc1_dims=256, fc2_dims=256,
-            chkpt_dir='tmp/'):
-        super(CriticNetwork, self).__init__()
-
-        self.checkpoint_file = os.path.join(chkpt_dir, 'critic_torch_ppo')
-        self.critic = nn.Sequential(
-                nn.Linear(*input_dims, fc1_dims),
-                nn.ReLU(),
-                nn.Linear(fc1_dims, fc2_dims),
-                nn.ReLU(),
-                nn.Linear(fc2_dims, 1)
-        )
-
-        self.optimizer = optim.AdamW(self.parameters(), lr=alpha)
+    def __init__(self, input_dims, lr, d_model=32, nhead=4, nlayers=2, dropout=0.1, chkpt_dir='tmp/'):
+        super().__init__()
+        self.checkpoint_file = os.path.join(chkpt_dir, 'critic_cont_trx')
+        if isinstance(input_dims, (tuple, list, np.ndarray)):
+            feat_dim = int(input_dims[-1])
+        else:
+            feat_dim = int(input_dims)
+        self.backbone = TransformerBackbone(feat_dim, d_model, nhead, nlayers, dropout)
+        self.fc_value = nn.Linear(d_model, 1)
+        self.optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
         self.to(self.device)
 
-    def forward(self, state):
-        value = self.critic(state)
+    def forward(self, state_seq):
+        h = self.backbone(state_seq)
+        return self.fc_value(h)
 
-        return value
+    def save_checkpoint(self): T.save(self.state_dict(), self.checkpoint_file)
+    def load_checkpoint(self): self.load_state_dict(T.load(self.checkpoint_file))
 
-    def save_checkpoint(self):
-        T.save(self.state_dict(), self.checkpoint_file)
-
-    def load_checkpoint(self):
-        self.load_state_dict(T.load(self.checkpoint_file))
-
+REWARD_SCALE = 100.0 
+# ===========================
+# PPO Agent
+# ===========================
 class Agent:
-    def __init__(self, n_actions, input_dims, gamma=0.99, alpha=0.0003, gae_lambda=0.95,
-            policy_clip=0.2, batch_size=64, n_epochs=10):
+    def __init__(self, n_actions, input_dims, gamma=0.99, lr=3e-4,
+                 gae_lambda=0.95, policy_clip=0.2, batch_size=512,
+                 n_epochs=8, entropy_coef=0.02, vf_clip=0.2,
+                 target_kl=0.02, kl_coef=0.0, max_grad_norm=1.0):
         self.gamma = gamma
         self.policy_clip = policy_clip
         self.n_epochs = n_epochs
         self.gae_lambda = gae_lambda
 
-        self.actor = ActorNetwork(n_actions, input_dims, alpha)
-        self.critic = CriticNetwork(input_dims, alpha)
+        self.entropy_coef_base = entropy_coef
+        self.entropy_floor = 0.005
+        self.learn_calls = 0
+
+        self.vf_clip = vf_clip
+        self.target_kl = target_kl
+        self.kl_coef = kl_coef
+        self.max_grad_norm = max_grad_norm
+
+        self.actor  = ActorNetwork(input_dims, lr)
+        self.critic = CriticNetwork(input_dims, lr)
         self.memory = PPOMemory(batch_size)
-       
-    def remember(self, state, action, probs, vals, reward, done):
-        self.memory.store_memory(state, action, probs, vals, reward, done)
+
+        self.seq_len = SEQ_LEN
+        self.state_window = deque(maxlen=self.seq_len)
+
+        self.actor_sched  = optim.lr_scheduler.CosineAnnealingLR(self.actor.optimizer,  T_max=200)
+        self.critic_sched = optim.lr_scheduler.CosineAnnealingLR(self.critic.optimizer, T_max=200)
+
+    def remember(self, state_seq, action, log_prob, value, reward, done):
+        self.memory.store_memory(state_seq, action, log_prob, value, reward, done)
 
     def save_models(self):
-        print('... saving models ...')
-        self.actor.save_checkpoint()
-        self.critic.save_checkpoint()
-
-    def load_models(self):
-        print('... loading models ...')
-        self.actor.load_checkpoint()
-        self.critic.load_checkpoint()
+        self.actor.save_checkpoint(); self.critic.save_checkpoint()
 
     def choose_action(self, observation):
-        state = T.tensor([observation], dtype=T.float).to(self.actor.device)
-        state = state.flatten(0)
+        self.state_window.append(np.asarray(observation, dtype=np.float32))
+        if len(self.state_window) < self.seq_len:
+            return np.array([0.0], dtype=np.float32), 0.0, 0.0, None
 
-        dist = self.actor(state)
-        value = self.critic(state)
-        action = dist.sample()
+        state_seq = np.stack(self.state_window, axis=0).astype(np.float32)
+        state_tensor = T.tensor(state_seq, dtype=T.float32,
+                                device=self.actor.device).unsqueeze(0)
+        with T.no_grad():
+            dist  = self.actor(state_tensor)
+            value = self.critic(state_tensor)
+            action = T.clamp(dist.sample(), -1.0, 1.0)
+        
+        # hysteresis / deadzone
+        TAU_ENTER, TAU_EXIT = 0.12, 0.04
+        if not hasattr(self, "policy_pos_cache"):
+            self.policy_pos_cache = 0.0
+        raw = float(action.squeeze().cpu().numpy())
+        if self.policy_pos_cache == 0.0:
+            if abs(raw) < TAU_ENTER: raw = 0.0
+        else:
+            if abs(raw) < TAU_EXIT:  raw = 0.0
+        self.policy_pos_cache = raw
+        
+        # ВАЖНО: лог-вероятность считаем для ИТОГОВОГО действия raw
+        a_tensor = T.tensor([[raw]], dtype=T.float32, device=self.actor.device)
+        log_prob = dist.log_prob(a_tensor).sum(dim=-1).item()
+        
+        return np.array([raw], dtype=np.float32), float(log_prob), float(value.item()), state_seq
 
-        probs = T.squeeze(dist.log_prob(action)).item()
-        action = T.squeeze(action).item()
-        value = T.squeeze(value).item()
-
-        return action, probs, value
 
     def learn(self):
+        if len(self.memory.states) < self.memory.batch_size:
+            return
+
+        device = self.actor.device
+        curr_entropy_coef = max(self.entropy_floor,
+                                self.entropy_coef_base * (0.5 ** (self.learn_calls / 10)))
+
         for _ in range(self.n_epochs):
-            state_arr, action_arr, old_prob_arr, vals_arr,\
-            reward_arr, dones_arr, batches = \
-                    self.memory.generate_batches()
+            (state_arr, action_arr, old_logp_arr,
+             vals_arr, reward_arr, dones_arr, batches) = self.memory.generate_batches()
 
-            values = vals_arr
-            advantage = np.zeros(len(reward_arr), dtype=np.float32)
-            
-            # Calculate the advantage
-            for t in range(len(reward_arr)-1):
-                discount = 1
-                a_t = 0
-                for k in range(t, len(reward_arr)-1):
-                    a_t += discount*(reward_arr[k] + self.gamma*values[k+1]*\
-                            (1-int(dones_arr[k])) - values[k])
-                    discount *= self.gamma*self.gae_lambda
-                advantage[t] = a_t
-            advantage = T.tensor(advantage).to(self.actor.device)
+            rewards = np.asarray(reward_arr, dtype=np.float32)
+            values  = np.asarray(vals_arr,    dtype=np.float32)
+            dones   = np.asarray(dones_arr,   dtype=np.float32)
 
-            values = T.tensor(values).to(self.actor.device)
+            # GAE(λ)
+            Tlen = len(rewards)
+            advantage = np.zeros(Tlen, dtype=np.float32)
+            gae = 0.0
+            for t in reversed(range(Tlen)):
+                if t == Tlen - 1:
+                    next_nonterminal = 0.0; next_value = 0.0
+                else:
+                    next_nonterminal = 1.0 - dones[t+1]; next_value = values[t+1]
+                delta = rewards[t] + self.gamma * next_value * next_nonterminal - values[t]
+                gae = delta + self.gamma * self.gae_lambda * next_nonterminal * gae
+                advantage[t] = gae
+
+            advantage_t = T.tensor(advantage, dtype=T.float32, device=device)
+            advantage_t = (advantage_t - advantage_t.mean()) / (advantage_t.std() + 1e-8)
+            values_t    = T.tensor(values,    dtype=T.float32, device=device)
+
+            states_all  = T.tensor(state_arr,  dtype=T.float32, device=device)
+            actions_all = T.tensor(action_arr, dtype=T.float32, device=device).unsqueeze(-1)
+            old_logp_all= T.tensor(old_logp_arr,dtype=T.float32, device=device)
+
+            early_stop = False
             for batch in batches:
-                states = T.tensor(state_arr[batch], dtype=T.float).to(self.actor.device)
-                old_probs = T.tensor(old_prob_arr[batch]).to(self.actor.device)
-                actions = T.tensor(action_arr[batch]).to(self.actor.device)
+                states   = states_all[batch]
+                actions  = actions_all[batch]
+                old_logp = old_logp_all[batch]
+                adv      = advantage_t[batch]
+                old_vals = values_t[batch]
+                returns  = adv + old_vals
 
                 dist = self.actor(states)
-                critic_value = self.critic(states)
+                new_logp = dist.log_prob(actions).sum(dim=-1)
+                ratio = (new_logp - old_logp).exp()
+                surr1 = ratio * adv
+                surr2 = T.clamp(ratio, 1 - self.policy_clip, 1 + self.policy_clip) * adv
+                actor_loss = -T.min(surr1, surr2).mean()
 
-                critic_value = T.squeeze(critic_value)
+                approx_kl = (old_logp - new_logp).mean()
+                actor_loss = actor_loss + self.kl_coef * approx_kl
 
-                new_probs = dist.log_prob(actions)
-                prob_ratio = new_probs.exp() / old_probs.exp()
-                #prob_ratio = (new_probs - old_probs).exp()
-                weighted_probs = advantage[batch] * prob_ratio
-                weighted_clipped_probs = T.clamp(prob_ratio, 1-self.policy_clip,
-                        1+self.policy_clip)*advantage[batch]
-                actor_loss = -T.min(weighted_probs, weighted_clipped_probs).mean()
+                value_pred = self.critic(states).squeeze(-1)
+                value_pred_clipped = old_vals + (value_pred - old_vals).clamp(-self.vf_clip, self.vf_clip)
 
-                returns = advantage[batch] + values[batch]
-                critic_loss = (returns-critic_value)**2
-                critic_loss = critic_loss.mean()
+                ret_t = returns  # без нормализации
+                vf_loss_unclipped = (value_pred - ret_t).pow(2)
+                vf_loss_clipped   = (value_pred_clipped - ret_t).pow(2)
 
-                total_loss = actor_loss + 0.5*critic_loss
-                self.actor.optimizer.zero_grad()
-                self.critic.optimizer.zero_grad()
+                critic_loss = T.max(vf_loss_unclipped, vf_loss_clipped).mean()
+
+                entropy = dist.entropy().mean()
+
+                total_loss = actor_loss + 0.5 * critic_loss - curr_entropy_coef * entropy
+
+                self.actor.optimizer.zero_grad(set_to_none=True)
+                self.critic.optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
+                nn.utils.clip_grad_norm_(self.actor.parameters(),  self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.actor.optimizer.step()
                 self.critic.optimizer.step()
 
+                if approx_kl.item() > 1.5 * self.target_kl:
+                    early_stop = True
+                    break
+
+            self.actor_sched.step()
+            self.critic_sched.step()
+            if early_stop: break
+
+        self.learn_calls += 1
         self.memory.clear_memory()
 
-def plot_learning_curve(x, scores, figure_file):
-    running_avg = np.zeros(len(scores))
-    for i in range(len(running_avg)):
-        running_avg[i] = np.mean(scores[max(0, i-50):(i+1)])
-    plt.plot(x, running_avg)
-    plt.title('Running average of previous 50 scores')
-    plt.savefig(figure_file)
+def make_env_slice(df_full, start_idx, end_idx):
+    df_slice = df_full.iloc[start_idx:end_idx].reset_index(drop=True).copy()
+    return StockTradingEnv(df_slice)
 
-if __name__ == '__main__':
-    env = StockTradingEnv(df_train_env)
-    N = 20
-    batch_size = 5
-    n_epochs = 3
-    alpha = 0.0003
-    agent = Agent(n_actions=env.action_space.n, batch_size=batch_size, 
-                    alpha=alpha, n_epochs=n_epochs, 
-                    input_dims=env.observation_space.shape)
+# ===========================
+# Train loop with curriculum + per-stage early stop + sane 'best'
+# ===========================
+def make_env_slice(df_full, start_idx, end_idx):
+    df_slice = df_full.iloc[start_idx:end_idx].reset_index(drop=True).copy()
+    return StockTradingEnv(df_slice)
 
-    n_games = 500
+env = StockTradingEnv(df_train)
+agent = Agent(
+    n_actions=1,
+    input_dims=env.observation_space.shape,
+    lr=7e-4,
+    batch_size=256,
+    n_epochs=8,
+    entropy_coef=0.04,
+    policy_clip=0.25,
+    target_kl=0.06,
+    max_grad_norm=0.7,
+    gae_lambda=0.98
+)
 
-    figure_file = 'stock_training.png'
+# name, slice_start, slice_end, learn_every_N, episodes
+stages = [
+    ("stage1", 0,   900,               256,  400),
+    ("stage2", 300, 1200,              384,  400),
+    ("stage3", 0,   len(df_train),     768, 1200),
+]
 
-    best_score = env.reward_range[0]
-    score_history = []
+global_best = float("-inf")     # лучший avg50 за всё обучение (для сохранения модели)
+print("... starting curriculum ...")
 
-    learn_iters = 0
-    avg_score = 0
+for name, s, e, N, n_games in stages:
+    env = make_env_slice(df_train, s, e)
+
+    # --- Early Stop: внутри стадии ---
+    patience  = 15        # сколько эпизодов подряд без улучшения терпим
+    min_delta = 2e-3      # минимальный прирост avg50, чтобы считать улучшением
+    stale = 0
+    local_best = float("-inf")
+
+    stage_scores = []     # история mean_score в этой стадии
     n_steps = 0
-    
-    print("... starting ...")
+
     for i in range(n_games):
-        observation = env.reset()
+        obs = env.reset(); agent.state_window.clear()
         done = False
-        score = 0
+        score = 0.0
+        zero_act = 0
+        total_act = 0
+        wins = losses = 0
+        ep_steps = 0
+
         while not done:
-            action, prob, val = agent.choose_action(observation)
-            observation_, reward, done, info = env.step(action)
+            action, logp, val, state_seq = agent.choose_action(obs)
+            total_act += 1
+            if abs(float(action[0])) < 1e-6:
+                zero_act += 1
+
+            obs_, reward, done, info = env.step(action)
+            ep_steps += 1
+            if info["base_reward"] > 0: wins += 1
+            elif info["base_reward"] < 0: losses += 1
+
+            if state_seq is not None:
+                agent.remember(state_seq, float(action[0]), logp, val, reward, done)
+
             n_steps += 1
             score += reward
-            agent.remember(observation, action, prob, val, reward, done)
             if n_steps % N == 0:
                 agent.learn()
-            observation = observation_
-            
-        # Save history
-        score_history.append(score)
-        avg_score = np.mean(score_history[-50:])
-        
-        if avg_score > best_score:
-            best_score = avg_score
+
+            obs = obs_
+
+        # честная нормализация на фактическую длину эпизода
+        mean_score = score / max(1, ep_steps)
+        stage_scores.append(mean_score)
+        avg50 = float(np.mean(stage_scores[-50:]))
+
+        # --- сохраняем модель по глобальному лучшему avg50 ---
+        if avg50 > global_best + 1e-12:
+            global_best = avg50
             agent.save_models()
-        
-        print(f"episide: {i}, score: {score}, avg score: {avg_score}, best_score: {best_score}")
-            
-    x = [i+1 for i in range(len(score_history))]
-    plot_learning_curve(x, score_history, figure_file)
 
-# agent.save_models()
-n_actions = env.action_space.n
-input_dims = env.observation_space.shape
-alpha = 0.0003
-model = ActorNetwork(n_actions, input_dims, alpha)
-model.load_state_dict(T.load("tmp/actor_torch_ppo"))
-model.eval()
+        # --- Early Stop внутри стадии ---
+        if avg50 > local_best + min_delta:
+            local_best = avg50
+            stale = 0
+        else:
+            stale += 1
+        if stale >= patience:
+            print(f"{name}: early stop at ep {i} | local_best={local_best:.4f} | global_best={global_best:.4f}")
+            break
 
-reporting_df = df_test.copy()  # тестовое окно
-long_probs, short_probs = [], []
+        zero_ratio = 100.0 * zero_act / max(1, total_act)
+        wr = wins / max(1, wins + losses)
 
-is_long = 1
-is_short = 1
-long_ratio = 0.5
+        pnl = env.net_profit
+        equity = env.available_balance
 
-import torch as T
+        print(
+            f"{name} | ep {i:4d} "
+            f"| mean {mean_score: .4f} "
+            f"| avg50 {avg50: .4f} "
+            f"| local_best {local_best: .4f} "
+            f"| global_best {global_best: .4f} "
+            f"| PnL ${pnl: .2f} | Equity ${equity: .2f} "
+            f"| winrate {wr:.1%} | zero% {zero_ratio: .1f}"
+        )
+
+# ===========================
+# Inference (test) + Backtest (только против Buy&Hold)
+# ===========================
+infer_model = agent.actor; infer_model.eval()
+MAX_LEVER = 1.0
+reporting_df = df_test.reset_index(drop=True).copy()
+
+lag = 20
+test_rets = reporting_df["Close_Price"].pct_change().fillna(0.0)
+test_vol  = test_rets.rolling(lag).std().fillna(test_rets.std())
+
+positions = []
+state_window = deque(maxlen=SEQ_LEN)
+with T.no_grad():
+    for step in range(len(reporting_df)):
+        r = reporting_df.iloc[step]
+        obs = np.array([
+            float(r["Open"]),  float(r["High"]),  float(r["Low"]),
+            float(r["Close"]), float(r["Volume"]), float(r["VWAP"]),
+            float(r["RSI"]),   float(r["EMA20"]), float(r["EMA50"]),
+            float(r["MACD"]),  float(r["MACD_signal"]),
+            float(r["BB_width"]),
+            float(r["RET1"]),  float(r["ATR"]),   float(r["VOL_REGIME"]),
+            0.0
+        ], dtype=np.float32)
+        obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        state_window.append(obs)
+        if len(state_window) < SEQ_LEN:
+            positions.append(0.0); continue
+        state_seq = np.stack(list(state_window), axis=0).astype(np.float32)[None, ...]
+        state_t   = T.tensor(state_seq, dtype=T.float32, device=infer_model.device)
+        dist = infer_model(state_t); mu = dist.mean
+        pos = float(T.clamp(mu, -1.0, 1.0).squeeze().cpu().numpy())
+        curr_vol = max(float(test_vol.iloc[step]), 1e-6)
+        scale = (TARGET_DAILY_VOL / curr_vol) if VOL_MODE == "full" else min(1.0, TARGET_DAILY_VOL / curr_vol)
+        eff_pos = float(np.clip(pos * scale, -MAX_LEVER, MAX_LEVER))
+        positions.append(eff_pos)
+
+
+# ===========================
+# FIRST BLOCK (patched to match the second)
+# ===========================
 import numpy as np
+import pandas as pd
 
-for step in range(5, len(reporting_df)):
-    # Берём ИМЕННО reporting_df, а не df_mod
-    row = reporting_df.iloc[step]
+# ---- constants (must match the second block) ----
+# PERCENT_CAPITAL = globals().get("PERCENT_CAPITAL", 0.2)
+# TURNOVER_COST   = globals().get("TURNOVER_COST",   1e-5)
+SLIPPAGE_BPS    = globals().get("SLIPPAGE_BPS",    1e-4)
 
-    item_0_T0 = float(row["Open"])
-    item_1_T0 = float(row["High"])
-    item_2_T0 = float(row["Low"])
-    item_3_T0 = float(row["Close"])
-    item_4_T0 = float(row["Volume"])
-    item_5_T0 = float(row["VWAP"])
+# ---- helpers for BH (same logic as in the second block) ----
+def bh_curve_from_prices(price_series, pct_capital=1.0):
+    px = np.asarray(price_series, dtype=float)
+    ret = np.zeros_like(px, dtype=float)
+    ret[1:] = (px[1:] - px[:-1]) / np.where(px[:-1]==0, 1e-12, px[:-1])
+    port = (1.0 + pct_capital * ret)
+    return np.maximum.accumulate(np.ones_like(port)) * port.cumprod()
 
-    obs = np.array([item_0_T0, item_1_T0, item_2_T0, item_3_T0, item_4_T0, item_5_T0, long_ratio],
-                   dtype=np.float32)
-
-    # если модель ждёт батч → добавим размерность
-    state = T.tensor(obs).float().unsqueeze(0)
-    if hasattr(model, "device"):
-        state = state.to(model.device)
-
-    out = model(state)  # logits или распределение
-    # Если у тебя Actor возвращает Categorical(logits=...), то:
-    if hasattr(out, "probs"):
-        probs = out.probs.squeeze(0).detach().cpu().numpy()
+def bh_test_from_full(price_full, test_like, pct_capital=1.0):
+    """
+    price_full: Series с DatetimeIndex (вся история)
+    test_like : DataFrame/Series/Index тестового окна
+    """
+    if isinstance(test_like, (pd.DataFrame, pd.Series)):
+        idx = test_like.index
     else:
-        # иначе считаем softmax вручную (logits -> probs)
-        probs_t = T.softmax(out, dim=-1)
-        probs = probs_t.squeeze(0).detach().cpu().numpy()
+        idx = test_like
 
-    action = int(np.argmax(probs))
-    print(action, probs)
-
-    # корректное обновление счётчиков
-    if action == 0:
-        is_long += 1
-    elif action == 1:
-        is_short += 1
-
-    den = is_long + is_short
-    long_ratio = float(is_long) / den if den > 0 else 0.5
-
-    long_probs.append(float(probs[0]))
-    short_probs.append(float(probs[1]))
-
-# --- helper: единый расчёт BH-кривой и аккуратный тестовый срез ---
-def bh_curve_from_prices(price_series, alloc):
-    ret = price_series.astype(float).pct_change().fillna(0.0).to_numpy()
-    return (1.0 + alloc * ret).cumprod()
-
-def bh_test_from_full(price_full, df_test, alloc):
-    # если индексы дат — берём .loc по датам; иначе — позициями .iloc
-    if isinstance(df_test.index, pd.DatetimeIndex) and isinstance(price_full.index, pd.DatetimeIndex):
-        price_test = price_full.loc[df_test.index]
-        price_test = price_test.reset_index(drop=True)
+    if isinstance(idx, pd.DatetimeIndex):
+        px = price_full.loc[idx]
     else:
-        start = len(price_full) - len(df_test)
-        price_test = price_full.iloc[start : start + len(df_test)].reset_index(drop=True)
-    return bh_curve_from_prices(price_test, alloc)
+        # индекс не по датам (RangeIndex) -> берём хвост нужной длины
+        n = len(idx)
+        px = price_full.iloc[-n:]
 
-# --- ваш блок с исправлениями ---
-capital = 1.0
-perc_invest = 0.3
+    return bh_curve_from_prices(px, pct_capital)
 
-# используем adjusted цены, если доступны
+
+
+# ---- source prices for BH (identical to the second block) ----
 price_full = (df["Adj Close"] if "Adj Close" in df.columns else df["Close"]).astype(float)
 
-# Buy&Hold на всём датасете
-bh_full = bh_curve_from_prices(price_full, perc_invest)
-ROI_BH_FULL = (bh_full[-1] - 1.0) * 100
+# ---------------- Backtest table (exactly same formulas as in the second) ----------------
+df_bt = reporting_df.copy()
+# Return must come from the actual Close_Price (same as second block)
+df_bt["Return"] = df_bt["Close_Price"].pct_change().fillna(0.0)
 
-# Buy&Hold на тестовом окне df_test (тот же источник цен)
-bh_test = bh_test_from_full(price_full, df_test, perc_invest)
-ROI_BH_TEST = (bh_test[-1] - 1.0) * 100
+# align positions length to N exactly like you do in the second block
+pos = np.asarray(positions, dtype=float).ravel()
+N = len(df_bt)
+if len(pos) < N:
+    pos = np.concatenate([np.zeros(N - len(pos)), pos])
+elif len(pos) > N:
+    pos = pos[-N:]
+df_bt["Position"] = pos
 
-# === Подготовка данных под стратегию из вероятностей (как у вас) ===
-reporting_df = df_test.reset_index(drop=True).copy()
-df_res = reporting_df[["Open", "Close_Price"]].copy()
-df_res["Returns"] = df_res["Close_Price"].pct_change().fillna(0.0)
+delta_pos = df_bt["Position"].diff().fillna(0.0)
 
-probs = pd.DataFrame({"Longs": long_probs, "Shorts": short_probs})
-N = len(df_res); M = len(probs)
-if M < N:
-    pad = pd.DataFrame({"Longs": np.zeros(N - M, dtype=float),
-                        "Shorts": np.zeros(N - M, dtype=float)})
-    probs = pd.concat([pad, probs], ignore_index=True)
-elif M > N:
-    probs = probs.iloc[-N:].reset_index(drop=True)
-else:
-    probs = probs.reset_index(drop=True)
+active_ret = (
+    df_bt["Position"].shift(1).fillna(0.0) * df_bt["Return"]
+    - (TURNOVER_COST + SLIPPAGE_BPS) * delta_pos.abs()
+)
+df_bt["PortRet"] = PERCENT_CAPITAL * active_ret
+df_bt["Equity"]  = (1.0 + df_bt["PortRet"]).cumprod()
 
-df_res = df_res.reset_index(drop=True)
-df_res = pd.concat([df_res, probs], axis=1)
+# ------------- Buy&Hold (FULL + TEST) exactly as in the second block -------------
+bh_full = bh_curve_from_prices(price_full, PERCENT_CAPITAL)
+ROI_BH_FULL = (bh_full[-1] - 1.0) * 100.0
 
-# направление: лонг = +Longs, шорт = -Shorts
-df_res["DIR"] = np.where(df_res["Longs"] >= 0.5, df_res["Longs"], -df_res["Shorts"]).astype(float)
+# ВАЖНО: используем ИМЕННО df_test с DatetimeIndex (а НЕ reporting_df)
+bh_test = bh_test_from_full(price_full, df_test, PERCENT_CAPITAL)
 
-# equity стратегии (позиция со вчера * сегодняшняя доходность)
-gross_step = 1.0 + perc_invest * df_res["DIR"].shift(1).fillna(0.0) * df_res["Returns"]
-df_res["Equity"] = capital * gross_step.cumprod()
+# align BH curve length to df_bt length (safe guard; normally lengths match)
+bh_series = pd.Series(bh_test, index=range(len(bh_test)))
+if len(bh_series) != len(df_bt):
+    if len(bh_series) > len(df_bt):
+        bh_series = bh_series.iloc[-len(df_bt):].reset_index(drop=True)
+    else:
+        pad = pd.Series([bh_series.iloc[0]] * (len(df_bt) - len(bh_series)))
+        bh_series = pd.concat([pad, bh_series], ignore_index=True)
 
-# Benchmark в таблице = тестовый срез BH, полный ROI печатаем отдельно
-df_res["Benchmark"] = bh_test
+df_bt["Benchmark"] = bh_series.values
+ROI_BH_TEST = (df_bt["Benchmark"].iloc[-1] - 1.0) * 100.0
 
-ROI = (df_res["Equity"].iloc[-1] - 1.0) * 100
-print(f"Strategy ROI:         {ROI:.2f}%")
-print(f"Buy&Hold ROI (TEST):  {ROI_BH_TEST:.2f}%")
-print(f"Buy&Hold ROI (FULL):  {ROI_BH_FULL:.2f}%")
+# ---------------- metrics (same outputs as the second block) ----------------
+ROI     = (df_bt["Equity"].iloc[-1]    - 1.0) * 100.0
+
+def max_drawdown(arr_like):
+    x = np.asarray(arr_like, dtype=float)
+    peak = np.maximum.accumulate(x)
+    return float((x / peak - 1.0).min())
+
+daily  = df_bt["PortRet"].to_numpy()
+eq     = df_bt["Equity"].to_numpy()
+sharpe = (daily.mean() / (daily.std() + 1e-12)) * np.sqrt(252.0)
+mdd    = max_drawdown(eq)
+
+print(f"\nBenchmark (BH @ {int(PERCENT_CAPITAL*100)}%) ROI: {ROI_BH_TEST:.2f}%")
+print(f"Strategy ROI:                         {ROI:.2f}%")
+print(f"Sharpe:                               {sharpe:.2f}")
+print(f"Max Drawdown:                         {mdd:.2%}")
